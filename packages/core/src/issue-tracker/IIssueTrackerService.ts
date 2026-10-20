@@ -25,6 +25,9 @@ import type {
 	FileUploadRequest,
 	FileUploadResponse,
 	Issue,
+	IssueCreateInput,
+	IssueRelationCreateInput,
+	IssueRelationCreateResult,
 	IssueTrackerAgentSession,
 	IssueTrackerAgentSessionPayload,
 	IssueUpdateInput,
@@ -165,6 +168,14 @@ export interface IIssueTrackerService {
 	 * **CLI Platform**: All properties are synchronous (no await needed).
 	 */
 	fetchIssue(idOrIdentifier: string): Promise<Issue>;
+
+	/** Create an issue, including child/project/delegation metadata. */
+	createIssue(input: IssueCreateInput): Promise<Issue>;
+
+	/** Create a durable relation such as blocker -> blocked. */
+	createIssueRelation(
+		input: IssueRelationCreateInput,
+	): Promise<IssueRelationCreateResult>;
 
 	/**
 	 * Fetch child issues (sub-issues) for a parent issue.
@@ -493,6 +504,9 @@ export interface IIssueTrackerService {
 	 * for an issue, commonly used for repository routing.
 	 */
 	getIssueLabels(issueId: string): Promise<string[]>;
+
+	/** Resolve a label by name, creating it when absent. */
+	findOrCreateLabel(name: string, teamId?: string): Promise<string>;
 
 	// ========================================================================
 	// WORKFLOW STATE OPERATIONS

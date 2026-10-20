@@ -24,13 +24,43 @@ export type {
 	ChatSessionHandlerDeps,
 } from "./ChatSessionHandler.js";
 export { ChatSessionHandler } from "./ChatSessionHandler.js";
+export type {
+	ManualBlockerInput,
+	MergeDecisionResult,
+	ParentCompletion,
+	PlanDecisionResult,
+	PullRequestApprovalInput,
+	StartPlanningInput,
+} from "./CustomWorkflowCoordinator.js";
+export {
+	CustomWorkflowCoordinator,
+	formatParentCompletionSummary,
+	parsePlannedChildren,
+} from "./CustomWorkflowCoordinator.js";
 export { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 export { EdgeWorker } from "./EdgeWorker.js";
 export { EgressProxy } from "./EgressProxy.js";
+export type {
+	MergeApprovedPullRequestRequest,
+	MergeApprovedPullRequestResult,
+	PullRequestInspection,
+	PullRequestInspectionRequest,
+} from "./GitHubPullRequestService.js";
+export {
+	GitHubPullRequestService,
+	MergeRevalidationError,
+} from "./GitHubPullRequestService.js";
 export type { CreateGitWorktreeOptions } from "./GitService.js";
 export { GitService } from "./GitService.js";
 export type { SerializedGlobalRegistryState } from "./GlobalSessionRegistry.js";
 export { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
+export type { ManualIssueBodyInput } from "./ManualIssueContract.js";
+export {
+	assertManualIssueContentIsSafe,
+	assertNonSecretText,
+	formatManualIssueBody,
+	redactSensitiveText,
+} from "./ManualIssueContract.js";
 export type { McpConfigServiceDeps } from "./McpConfigService.js";
 export { McpConfigService } from "./McpConfigService.js";
 export { RepositoryRouter } from "./RepositoryRouter.js";

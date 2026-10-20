@@ -44,6 +44,11 @@ import type {
 // biome-ignore lint/complexity/noBannedTypes: Empty events type (events removed in CYPACK-996 skill refactor)
 export type AgentSessionManagerEvents = {};
 
+export type SessionResultHandler = (
+	sessionId: string,
+	resultMessage: SDKResultMessage,
+) => Promise<{ suppressParentResume?: boolean } | undefined>;
+
 /**
  * Type-safe event emitter interface for AgentSessionManager
  */
@@ -96,6 +101,7 @@ export class AgentSessionManager extends EventEmitter {
 		prompt: string,
 		childSessionId: string,
 	) => Promise<void>;
+	private sessionResultHandler?: SessionResultHandler;
 
 	constructor(
 		getParentSessionId?: (childSessionId: string) => string | undefined,
@@ -110,6 +116,14 @@ export class AgentSessionManager extends EventEmitter {
 		this.logger = logger ?? createLogger({ component: "AgentSessionManager" });
 		this.getParentSessionId = getParentSessionId;
 		this.resumeParentSession = resumeParentSession;
+	}
+
+	/**
+	 * Register a runner-independent lifecycle hook for persistent workflows.
+	 * The hook runs after the visible result is posted but before parent resume.
+	 */
+	setSessionResultHandler(handler: SessionResultHandler | undefined): void {
+		this.sessionResultHandler = handler;
 	}
 
 	/**
@@ -411,13 +425,22 @@ export class AgentSessionManager extends EventEmitter {
 			}
 		}
 
+		let suppressParentResume = false;
+		if (!pendingWork && this.sessionResultHandler) {
+			const workflowResult = await this.sessionResultHandler(
+				sessionId,
+				resultMessage,
+			);
+			suppressParentResume = workflowResult?.suppressParentResume === true;
+		}
+
 		// Handle child session completion. A session held open for pending
 		// work is not done yet: the wakeup or background task will stream more
 		// messages in, ending in another result. Resuming the parent now would
 		// hand it a non-final result and resume it again later, so defer the
 		// callback to the result that actually ends the session.
 		const parentSessionId = this.getParentSessionId?.(sessionId);
-		if (parentSessionId && this.resumeParentSession) {
+		if (parentSessionId && this.resumeParentSession && !suppressParentResume) {
 			if (pendingWork) {
 				log.info(
 					`Child session has pending work; deferring parent ${parentSessionId} resume until the session finishes`,
@@ -1351,6 +1374,21 @@ export class AgentSessionManager extends EventEmitter {
 		return this.sessions.get(sessionId);
 	}
 
+	/** Switch a parked/planning session to a new execution workspace. */
+	updateSessionExecutionContext(
+		sessionId: string,
+		workspace: Workspace,
+		repositories: RepositoryContext[],
+	): CyrusAgentSession {
+		const session = this.sessions.get(sessionId);
+		if (!session) throw new Error(`No session found for ${sessionId}`);
+		session.workspace = workspace;
+		session.repositories = repositories;
+		session.status = AgentSessionStatus.Active;
+		session.updatedAt = Date.now();
+		return session;
+	}
+
 	/**
 	 * Get session entries by session ID
 	 */
@@ -1645,6 +1683,25 @@ export class AgentSessionManager extends EventEmitter {
 				content: { type: "elicitation", body },
 				signal: "auth",
 				signalMetadata: { url: approvalUrl },
+			},
+			"approval elicitation",
+		);
+	}
+
+	/** Create a persistent select interaction whose values carry correlation IDs. */
+	async createSelectElicitation(
+		sessionId: string,
+		body: string,
+		options: string[],
+	): Promise<void> {
+		await this.postActivity(
+			sessionId,
+			{
+				content: { type: "elicitation", body },
+				signal: "select",
+				signalMetadata: {
+					options: options.map((value) => ({ value })),
+				},
 			},
 			"approval elicitation",
 		);

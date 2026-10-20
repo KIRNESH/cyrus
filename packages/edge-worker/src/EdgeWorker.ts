@@ -8,6 +8,7 @@ import { LinearClient } from "@linear/sdk";
 import type {
 	McpServerConfig,
 	SDKMessage,
+	SDKResultMessage,
 	SessionStore,
 	WarmQuery,
 } from "cyrus-claude-runner";
@@ -44,6 +45,7 @@ import type {
 	IssueStateChangeMessage,
 	IssueUnassignedWebhook,
 	IssueUpdateWebhook,
+	PersistentCustomWorkflow,
 	RepositoryConfig,
 	RunnerType,
 	SerializableEdgeWorkerState,
@@ -159,10 +161,23 @@ import { LiveChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 import type { ChatSessionHandlerDeps } from "./ChatSessionHandler.js";
 import { ChatSessionHandler } from "./ChatSessionHandler.js";
 import { ConfigManager, type RepositoryChanges } from "./ConfigManager.js";
+import {
+	CustomWorkflowCoordinator,
+	formatParentCompletionSummary,
+} from "./CustomWorkflowCoordinator.js";
 import { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 import { EgressProxy } from "./EgressProxy.js";
+import {
+	GitHubPullRequestService,
+	MergeRevalidationError,
+} from "./GitHubPullRequestService.js";
 import { GitService } from "./GitService.js";
 import { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
+import {
+	assertNonSecretText,
+	formatManualIssueBody,
+	redactSensitiveText,
+} from "./ManualIssueContract.js";
 import { McpConfigService } from "./McpConfigService.js";
 import { PromptBuilder } from "./PromptBuilder.js";
 import type {
@@ -269,6 +284,8 @@ export class EdgeWorker extends EventEmitter {
 	private activityPoster: ActivityPoster;
 	private configManager: ConfigManager;
 	private promptBuilder: PromptBuilder;
+	private customWorkflow = new CustomWorkflowCoordinator();
+	private githubPullRequestService = new GitHubPullRequestService();
 	private defaultSkillsDeployer: DefaultSkillsDeployer;
 	private skillsPluginResolver: SkillsPluginResolver;
 	private readonly cyrusToolsMcpEndpoint = "/mcp/cyrus-tools";
@@ -513,6 +530,9 @@ export class EdgeWorker extends EventEmitter {
 					childSessionId,
 				);
 			},
+		);
+		this.agentSessionManager.setSessionResultHandler?.((sessionId, result) =>
+			this.handleCustomWorkflowRunnerResult(sessionId, result),
 		);
 
 		// Initialize repositories with path resolution
@@ -3654,6 +3674,10 @@ ${taskSection}`;
 		);
 
 		const issueId = message.workItemId;
+		await this.handleCustomWorkflowTerminalIssue(
+			issueId,
+			message.organizationId,
+		);
 
 		// Stop all active sessions for this issue
 		const sessions = this.agentSessionManager.getSessionsByIssueId(issueId);
@@ -4134,6 +4158,12 @@ ${taskSection}`;
 			return;
 		}
 
+		await this.handleCustomWorkflowTerminalIssue(
+			completedIssueId,
+			linearWorkspaceId,
+			stateType,
+		);
+
 		this.logger.debug(
 			`Issue ${issueIdentifier} moved to ${stateType} — checking for parked sessions to wake`,
 		);
@@ -4193,6 +4223,74 @@ ${taskSection}`;
 					error,
 				);
 			}
+		}
+	}
+
+	private async handleCustomWorkflowTerminalIssue(
+		issueId: string,
+		linearWorkspaceId: string,
+		knownStateType?: string,
+	): Promise<void> {
+		const issueTracker = this.issueTrackers.get(linearWorkspaceId);
+		if (!issueTracker) return;
+		let stateType = knownStateType;
+		if (!stateType) {
+			try {
+				const issue = await issueTracker.fetchIssue(issueId);
+				stateType = (await issue.state)?.type;
+			} catch {
+				stateType = "canceled";
+			}
+		}
+
+		const waitingOnManual = this.customWorkflow
+			.list()
+			.filter((workflow) =>
+				Object.values(workflow.manualBlockers).some(
+					(blocker) =>
+						blocker.issueId === issueId && blocker.status !== "verified",
+				),
+			);
+		if (waitingOnManual.length > 0) {
+			if (stateType === "completed") {
+				const workflows = this.customWorkflow.manualIssueCompleted(issueId);
+				await this.savePersistedState(true);
+				for (const workflow of workflows) {
+					await this.agentSessionManager.createThoughtActivity(
+						workflow.sessionId,
+						"The Manual issue is Done. Running its required non-secret verification before implementation can resume.",
+					);
+					await this.startManualVerification(workflow);
+				}
+			} else {
+				for (const workflow of waitingOnManual) {
+					await this.agentSessionManager.createErrorActivity(
+						workflow.sessionId,
+						"The Manual issue was canceled. The dependent implementation remains blocked and was not resumed.",
+					);
+				}
+			}
+		}
+
+		const workflow = this.customWorkflow.get(issueId);
+		if (
+			workflow &&
+			!new Set(["done", "rejected", "canceled", "failed"]).has(workflow.phase)
+		) {
+			const nextIssueId = this.customWorkflow.markCanceled(
+				issueId,
+				stateType === "completed"
+					? "Issue was marked complete outside the protected merge workflow"
+					: "Issue was canceled externally",
+			);
+			await this.savePersistedState(true);
+			if (nextIssueId) {
+				const next = this.customWorkflow.get(nextIssueId);
+				if (next) await this.startApprovedFeatureImplementation(next);
+			}
+			await this.startNextChildAndFinalizeParent(
+				workflow.parentWorkflowIssueId,
+			);
 		}
 	}
 
@@ -4640,6 +4738,21 @@ ${taskSection}`;
 			linearWorkspaceId,
 		);
 
+		// Delegated Product/PRD and Feature issues use the persistent approval
+		// workflow. Planning runs against the persistent checkout and therefore
+		// happens before blocker/worktree initialization.
+		if (
+			await this.tryStartCustomWorkflowPlanning(
+				agentSession,
+				repositories,
+				linearWorkspaceId,
+				commentBody,
+				baseBranchOverrides,
+			)
+		) {
+			return;
+		}
+
 		// Check for blocked-by dependencies before starting work
 		const blockResult = await this.checkBlockedByDependencies(
 			agentSession,
@@ -4927,6 +5040,1069 @@ ${taskSection}`;
 		}
 	}
 
+	private async tryStartCustomWorkflowPlanning(
+		agentSession: AgentSessionCreatedWebhook["agentSession"],
+		repositories: RepositoryConfig[],
+		linearWorkspaceId: string,
+		commentBody?: string | null,
+		baseBranchOverrides?: Map<string, string>,
+	): Promise<boolean> {
+		const issueRef = agentSession.issue;
+		if (!issueRef) return false;
+		const delegationMarker = "This thread is for an agent session";
+		if (!commentBody?.includes(delegationMarker)) return false;
+
+		const issueTracker = this.issueTrackers.get(linearWorkspaceId);
+		if (!issueTracker) return false;
+		const fullIssue = await issueTracker.fetchIssue(issueRef.id);
+		const labels = (await issueTracker.getIssueLabels(issueRef.id)) ?? [];
+		const normalizedLabels = new Set(
+			labels.map((label) => label.trim().toLowerCase()),
+		);
+		const kind = ["product", "product idea", "prd"].some((label) =>
+			normalizedLabels.has(label),
+		)
+			? "parent"
+			: normalizedLabels.has("feature")
+				? "feature"
+				: undefined;
+		if (!kind) return false;
+
+		const primaryRepo = repositories[0]!;
+		const authorizedUserId = agentSession.creator?.id;
+		if (!authorizedUserId || !fullIssue.teamId) {
+			await this.activityPoster.postActivityDirect(
+				issueTracker,
+				{
+					agentSessionId: agentSession.id,
+					content: {
+						type: "response",
+						body: "I couldn't start the approval workflow because the delegating user or Linear team identity is missing.",
+					},
+				},
+				"workflow setup error",
+			);
+			return true;
+		}
+
+		const existing = this.customWorkflow.get(issueRef.id);
+		if (existing) {
+			this.logger.info(
+				`Ignoring duplicate workflow start for ${issueRef.identifier} in ${existing.phase}`,
+			);
+			return true;
+		}
+
+		await this.moveIssueToStartedState(fullIssue, linearWorkspaceId);
+		const issueMinimal = this.convertLinearIssueToCore(fullIssue);
+		const repoPaths = Object.fromEntries(
+			repositories.map((repository) => [
+				repository.id,
+				repository.repositoryPath,
+			]),
+		);
+		const resolvedBaseBranches = Object.fromEntries(
+			repositories.map((repository) => [
+				repository.id,
+				{
+					branch:
+						baseBranchOverrides?.get(repository.id) ?? repository.baseBranch,
+					source: baseBranchOverrides?.has(repository.id)
+						? ("commit-ish" as const)
+						: ("default" as const),
+				},
+			]),
+		);
+		const workspace = {
+			path: primaryRepo.repositoryPath,
+			isGitWorktree: false,
+			repoPaths,
+			resolvedBaseBranches,
+		};
+		const repositoryContexts = repositories.map((repository) => ({
+			repositoryId: repository.id,
+			branchName: issueMinimal.branchName,
+			baseBranchName: resolvedBaseBranches[repository.id]?.branch,
+		}));
+		this.agentSessionManager.createCyrusAgentSession(
+			agentSession.id,
+			issueRef.id,
+			issueMinimal,
+			workspace,
+			"linear",
+			repositoryContexts,
+		);
+		this.sessionRepositories.set(agentSession.id, primaryRepo.id);
+		const sink = this.getActivitySinkForRepo(primaryRepo.id);
+		if (sink) this.agentSessionManager.setActivitySink(agentSession.id, sink);
+
+		const parentIssue = await fullIssue.parent;
+		const parentWorkflow = parentIssue
+			? this.customWorkflow.get(parentIssue.id)
+			: undefined;
+		const inheritedDependencyFailure = parentWorkflow
+			? Object.values(parentWorkflow.children).find(
+					(child) =>
+						child.issueId === fullIssue.id && child.status === "failed",
+				)
+			: undefined;
+		const rawAgentSession = agentSession as unknown as {
+			appUser?: { id?: string };
+			appUserId?: string;
+		};
+		const { workflow } = this.customWorkflow.startPlanning({
+			issueId: fullIssue.id,
+			issueIdentifier: fullIssue.identifier,
+			...(fullIssue.url ? { issueUrl: fullIssue.url } : {}),
+			sessionId: agentSession.id,
+			linearWorkspaceId,
+			repositoryId: primaryRepo.id,
+			kind,
+			authorizedUserId,
+			...(fullIssue.delegateId ||
+			rawAgentSession.appUser?.id ||
+			rawAgentSession.appUserId
+				? {
+						delegateId:
+							fullIssue.delegateId ??
+							rawAgentSession.appUser?.id ??
+							rawAgentSession.appUserId,
+					}
+				: {}),
+			...(parentIssue ? { parentIssueId: parentIssue.id } : {}),
+			...(parentWorkflow
+				? { parentWorkflowIssueId: parentWorkflow.issueId }
+				: {}),
+			teamId: fullIssue.teamId,
+			...(fullIssue.projectId ? { projectId: fullIssue.projectId } : {}),
+			branchName: issueMinimal.branchName,
+			baseBranch: resolvedBaseBranches[primaryRepo.id]?.branch,
+		});
+		if (inheritedDependencyFailure) {
+			this.customWorkflow.markFailed(
+				fullIssue.id,
+				inheritedDependencyFailure.result ??
+					"A required child dependency did not complete successfully",
+			);
+		} else if (parentWorkflow) {
+			this.customWorkflow.bindFeatureToParent(fullIssue.id);
+		}
+		await this.savePersistedState(true);
+		await this.postInstantAcknowledgment(agentSession.id, linearWorkspaceId);
+		if (inheritedDependencyFailure) {
+			await this.agentSessionManager.createErrorActivity(
+				workflow.sessionId,
+				inheritedDependencyFailure.result ??
+					"Planning will not start because a required dependency failed.",
+			);
+			await this.moveIssueToCanceledState(
+				workflow.issueId,
+				workflow.linearWorkspaceId,
+			);
+			await this.startNextChildAndFinalizeParent(parentWorkflow?.issueId);
+			return true;
+		}
+		await this.startCustomPlanningRunner(workflow, fullIssue, labels);
+		return true;
+	}
+
+	private async startCustomPlanningRunner(
+		workflow: PersistentCustomWorkflow,
+		fullIssue?: Issue,
+		labels?: string[],
+		revisionFeedback?: string,
+	): Promise<void> {
+		const repository = this.repositories.get(workflow.repositoryId);
+		const session = this.agentSessionManager.getSession(workflow.sessionId);
+		const issueTracker = this.issueTrackers.get(workflow.linearWorkspaceId);
+		if (!repository || !session || !issueTracker) {
+			throw new Error(
+				`Cannot restore planning context for ${workflow.issueIdentifier}`,
+			);
+		}
+		const issue =
+			fullIssue ?? (await issueTracker.fetchIssue(workflow.issueId));
+		const issueLabels =
+			labels ?? (await issueTracker.getIssueLabels(workflow.issueId));
+		const allowedDirectories = [
+			...new Set(
+				Object.values(
+					session.workspace.repoPaths ?? {
+						[repository.id]: repository.repositoryPath,
+					},
+				),
+			),
+		];
+		const resumeSessionId =
+			session.claudeSessionId ??
+			session.geminiSessionId ??
+			session.codexSessionId ??
+			session.cursorSessionId ??
+			session.opencodeSessionId;
+		const systemPrompt = `You are Cyrus's read-only planning stage. Inspect the repository and produce a concrete implementation plan, but do not mutate files or repository state, execute shell commands, create branches, commit, push, or open pull requests. Your final answer must be the complete plan and no implementation work.${
+			workflow.kind === "parent"
+				? `\nFor an approved product/PRD plan, end with exactly one machine-readable block:\n<implementation_children>{"children":[{"key":"stable-key","title":"Independently reviewable feature","description":"Complete implementation scope","dependencies":["other-key"]}]}</implementation_children>\nUse an empty children array only when no implementation child is required.`
+				: ""
+		}`;
+		const userPrompt = revisionFeedback
+			? `Revise the previous read-only plan for ${issue.identifier}. Apply this feedback and replace the prior plan in full:\n\n${revisionFeedback}`
+			: `Create a read-only implementation plan for ${issue.identifier}: ${issue.title}\n\n${issue.description ?? "(No description provided)"}`;
+		const { config, runnerType } = await this.buildAgentRunnerConfig(
+			session,
+			repository,
+			workflow.sessionId,
+			systemPrompt,
+			[],
+			allowedDirectories,
+			[],
+			resumeSessionId,
+			issueLabels,
+			issue.description || undefined,
+			undefined,
+			workflow.linearWorkspaceId,
+			this.buildSkillSessionContext(repository, issue, session),
+			"linear",
+			"planning",
+		);
+		const runner = this.createRunnerForType(runnerType, config);
+		this.agentSessionManager.addAgentRunner(workflow.sessionId, runner);
+		await this.savePersistedState();
+		if (runner.supportsStreamingInput && runner.startStreaming) {
+			await runner.startStreaming(userPrompt);
+		} else {
+			await runner.start(userPrompt);
+		}
+	}
+
+	private async decomposeApprovedParent(
+		parent: PersistentCustomWorkflow,
+	): Promise<void> {
+		if (parent.kind !== "parent" || parent.phase !== "orchestrating") {
+			throw new Error(
+				`Workflow ${parent.issueIdentifier} is not ready to decompose`,
+			);
+		}
+		if (!parent.delegateId) {
+			this.customWorkflow.markFailed(
+				parent.issueId,
+				"Linear did not provide the Cyrus delegate identity required for child delegation",
+			);
+			await this.savePersistedState(true);
+			await this.agentSessionManager.createErrorActivity(
+				parent.sessionId,
+				"The approved plan could not create children because Linear did not provide Cyrus's supported delegate identity.",
+			);
+			return;
+		}
+
+		const issueTracker = this.issueTrackers.get(parent.linearWorkspaceId);
+		if (!issueTracker) throw new Error("Issue tracker is unavailable");
+		const featureLabelId = await issueTracker.findOrCreateLabel(
+			"Feature",
+			parent.teamId,
+		);
+		const stateId = await this.resolveInitialWorkflowStateId(
+			issueTracker,
+			parent.teamId,
+		);
+		const existingChildren = await issueTracker.fetchIssueChildren(
+			parent.issueId,
+			{
+				limit: 250,
+				includeCompleted: true,
+				includeArchived: false,
+			},
+		);
+
+		for (const spec of parent.plannedChildren) {
+			const marker = `<!-- cyrus-workflow:${parent.issueId}:${parent.planRevision}:${spec.key} -->`;
+			let child = parent.children[spec.key]?.issueId
+				? await issueTracker.fetchIssue(parent.children[spec.key]!.issueId!)
+				: existingChildren.children.find((candidate) =>
+						(candidate.description ?? "").includes(marker),
+					);
+			if (!child) {
+				child = await issueTracker.createIssue({
+					teamId: parent.teamId,
+					title: spec.title,
+					description: `${spec.description}\n\n${marker}`,
+					stateId,
+					parentId: parent.issueId,
+					...(parent.projectId ? { projectId: parent.projectId } : {}),
+					delegateId: parent.delegateId,
+					labelIds: [featureLabelId],
+				});
+			}
+			this.customWorkflow.registerChildIssue(parent.issueId, spec.key, {
+				issueId: child.id,
+				issueIdentifier: child.identifier,
+				...(child.url ? { issueUrl: child.url } : {}),
+			});
+			if (this.customWorkflow.get(child.id)) {
+				this.customWorkflow.bindFeatureToParent(child.id);
+			}
+			this.repositoryRouter
+				.getIssueRepositoryCache()
+				.set(child.id, [parent.repositoryId]);
+			await this.savePersistedState(true);
+		}
+
+		for (const spec of parent.plannedChildren) {
+			for (const dependencyKey of spec.dependencies) {
+				const relationKey = `${dependencyKey}->${spec.key}`;
+				if (
+					this.customWorkflow.hasDependencyRelation(parent.issueId, relationKey)
+				) {
+					continue;
+				}
+				const blocker = parent.children[dependencyKey];
+				const blocked = parent.children[spec.key];
+				if (!blocker?.issueId || !blocked?.issueId) {
+					throw new Error(`Cannot create incomplete dependency ${relationKey}`);
+				}
+				await issueTracker.createIssueRelation({
+					issueId: blocker.issueId,
+					relatedIssueId: blocked.issueId,
+					type: "blocks",
+				});
+				this.customWorkflow.recordDependencyRelation(
+					parent.issueId,
+					relationKey,
+				);
+				await this.savePersistedState(true);
+			}
+		}
+
+		this.customWorkflow.finishDecomposition(parent.issueId);
+		await this.savePersistedState(true);
+		const childList = parent.plannedChildren
+			.map((spec) => {
+				const child = parent.children[spec.key];
+				return `- ${child?.issueUrl ? `[${child.issueIdentifier}](${child.issueUrl})` : child?.issueIdentifier}: ${spec.title}`;
+			})
+			.join("\n");
+		await this.agentSessionManager.createResponseActivity(
+			parent.sessionId,
+			`Approved plan decomposed into ${parent.plannedChildren.length} independently approved Feature issue(s):\n\n${childList}\n\nEach child must complete its own read-only plan and approval gate. At most one approved child implementation runs at a time.`,
+		);
+	}
+
+	private async resolveInitialWorkflowStateId(
+		issueTracker: IIssueTrackerService,
+		teamId: string,
+	): Promise<string> {
+		const states = await issueTracker.fetchWorkflowStates(teamId, {
+			first: 250,
+		});
+		const state =
+			states.nodes.find((candidate) => candidate.type === "unstarted") ??
+			states.nodes.find((candidate) => candidate.type === "backlog");
+		if (!state) {
+			throw new Error(`Team ${teamId} has no To Do-equivalent workflow state`);
+		}
+		return state.id;
+	}
+
+	private async startApprovedFeatureImplementation(
+		workflow: PersistentCustomWorkflow,
+	): Promise<void> {
+		if (!this.customWorkflow.isFeatureReady(workflow.issueId)) return;
+		const repository = this.repositories.get(workflow.repositoryId);
+		const issueTracker = this.issueTrackers.get(workflow.linearWorkspaceId);
+		const session = this.agentSessionManager.getSession(workflow.sessionId);
+		if (!repository || !issueTracker || !session) {
+			throw new Error(
+				`Cannot restore implementation context for ${workflow.issueIdentifier}`,
+			);
+		}
+		const fullIssue = await issueTracker.fetchIssue(workflow.issueId);
+		await this.moveIssueToStartedState(fullIssue, workflow.linearWorkspaceId);
+		const repositories = [repository];
+		const workspace = this.config.handlers?.createWorkspace
+			? await this.config.handlers.createWorkspace(fullIssue, repositories, {
+					onRepoSetupHookEvent: (activity) =>
+						this.activityPoster.postRepoSetupHookActivity(
+							workflow.sessionId,
+							workflow.linearWorkspaceId,
+							activity,
+						),
+				})
+			: await this.gitService.createGitWorktree(fullIssue, repositories, {
+					onRepoSetupHookEvent: (activity) =>
+						this.activityPoster.postRepoSetupHookActivity(
+							workflow.sessionId,
+							workflow.linearWorkspaceId,
+							activity,
+						),
+				});
+		const issueMinimal = this.convertLinearIssueToCore(fullIssue);
+		this.agentSessionManager.updateSessionExecutionContext(
+			workflow.sessionId,
+			workspace,
+			[
+				{
+					repositoryId: repository.id,
+					branchName: issueMinimal.branchName,
+					baseBranchName:
+						workspace.resolvedBaseBranches?.[repository.id]?.branch ??
+						repository.baseBranch,
+				},
+			],
+		);
+
+		const attachmentResult = await this.downloadIssueAttachments(
+			fullIssue,
+			workflow.linearWorkspaceId,
+			workspace.path,
+		);
+		const attachmentsDir = join(
+			this.cyrusHome,
+			basename(workspace.path),
+			"attachments",
+		);
+		await mkdir(attachmentsDir, { recursive: true });
+		const claudeSettingsDir = join(workspace.path, ".claude");
+		await mkdir(claudeSettingsDir, { recursive: true });
+		await writeFile(
+			join(claudeSettingsDir, "settings.local.json"),
+			JSON.stringify({ includeCoAuthoredBy: false }, null, "\t"),
+		);
+		const allowedDirectories = [
+			...new Set([
+				attachmentsDir,
+				repository.repositoryPath,
+				...this.gitService.getGitMetadataDirectoriesForWorkspace(workspace),
+			]),
+		];
+		const labels = await issueTracker.getIssueLabels(workflow.issueId);
+		const systemPromptResult = await this.determineSystemPromptFromLabels(
+			labels,
+			repository,
+		);
+		const systemPrompt = `${systemPromptResult?.prompt ?? ""}\n\n${this.customWorkflowImplementationAddendum()}`;
+		const issuePrompt = await this.promptBuilder.buildIssueContextPrompt(
+			fullIssue,
+			repositories,
+			undefined,
+			attachmentResult.manifest,
+			undefined,
+			workspace.resolvedBaseBranches,
+			workspace.repoPaths,
+		);
+		const allowedTools = this.buildAllowedTools(repositories, "builder").filter(
+			(tool) =>
+				!tool.startsWith("mcp__") ||
+				tool === "mcp__linear" ||
+				tool === "mcp__cyrus-tools" ||
+				tool === "mcp__cyrus-docs",
+		);
+		const disallowedTools = [
+			...this.buildDisallowedTools(repositories, "builder"),
+			"Bash(gh pr merge *)",
+			"Bash(gh api *pulls/*/merge*)",
+			"Bash(gt merge *)",
+			"Bash(git push * --delete *)",
+		];
+		this.customWorkflow.markImplementationStarted(workflow.issueId);
+		await this.savePersistedState(true);
+		const { config, runnerType } = await this.buildAgentRunnerConfig(
+			session,
+			repository,
+			workflow.sessionId,
+			systemPrompt,
+			allowedTools,
+			allowedDirectories,
+			disallowedTools,
+			undefined,
+			labels,
+			fullIssue.description || undefined,
+			undefined,
+			workflow.linearWorkspaceId,
+			this.buildSkillSessionContext(repository, fullIssue, session),
+			"linear",
+			"implementation",
+		);
+		const runner = this.createRunnerForType(runnerType, config);
+		this.agentSessionManager.addAgentRunner(workflow.sessionId, runner);
+		await this.savePersistedState();
+		const prompt = `${issuePrompt.prompt}\n\n<approved_plan revision="${workflow.planRevision}">\n${workflow.plan}\n</approved_plan>\n\nImplement only this approved plan in the isolated worktree.`;
+		if (runner.supportsStreamingInput && runner.startStreaming) {
+			await runner.startStreaming(prompt);
+		} else {
+			await runner.start(prompt);
+		}
+	}
+
+	private customWorkflowImplementationAddendum(): string {
+		return `This is an approved implementation stage. Work only inside the isolated worktree. If work requires a credential/secret/certificate/account action, spending or vendor lock-in, DNS/OAuth/billing/identity/app-store/provider-console action, a host package or system service, a production deployment decision, or anything outside your authority, call linear_create_manual_blocker and stop. Never request or expose a secret. After creating the pull request and confirming required checks pass, call github_request_merge_approval. Never merge or delete the branch yourself; only Cyrus's protected approval service may do that.`;
+	}
+
+	private async handleManualBlockerRequest(input: {
+		sessionId: string;
+		key: string;
+		title: string;
+		why: string;
+		options?: string;
+		steps: string;
+		handBack: string;
+		verify: string;
+	}): Promise<{
+		issueIdentifier: string;
+		issueUrl?: string;
+		created: boolean;
+	}> {
+		const workflow = this.customWorkflow.getBySessionId(input.sessionId);
+		if (!workflow || workflow.kind !== "feature") {
+			throw new Error(
+				"Manual blockers are only available in approved Feature workflows",
+			);
+		}
+		const existing = workflow.manualBlockers[input.key];
+		if (existing) {
+			return {
+				issueIdentifier: existing.issueIdentifier,
+				...(existing.issueUrl ? { issueUrl: existing.issueUrl } : {}),
+				created: false,
+			};
+		}
+		const issueTracker = this.issueTrackers.get(workflow.linearWorkspaceId);
+		if (!issueTracker) throw new Error("Issue tracker is unavailable");
+		const marker = `<!-- cyrus-manual:${workflow.issueId}:${input.key} -->`;
+		const body = `${formatManualIssueBody({
+			why: input.why,
+			...(input.options ? { options: input.options } : {}),
+			steps: input.steps,
+			handBack: input.handBack,
+			verify: input.verify,
+		})}\n\n${marker}`;
+		const manualLabelId = await issueTracker.findOrCreateLabel(
+			"Manual",
+			workflow.teamId,
+		);
+		const stateId = await this.resolveInitialWorkflowStateId(
+			issueTracker,
+			workflow.teamId,
+		);
+		const children = await issueTracker.fetchIssueChildren(workflow.issueId, {
+			limit: 250,
+			includeCompleted: true,
+			includeArchived: false,
+		});
+		let manualIssue = children.children.find((candidate) =>
+			(candidate.description ?? "").includes(marker),
+		);
+		if (!manualIssue) {
+			manualIssue = await issueTracker.createIssue({
+				teamId: workflow.teamId,
+				title: input.title,
+				description: body,
+				stateId,
+				assigneeId: workflow.authorizedUserId,
+				parentId: workflow.issueId,
+				...(workflow.projectId ? { projectId: workflow.projectId } : {}),
+				labelIds: [manualLabelId],
+				// Deliberately no delegateId: this issue belongs to the human.
+			});
+		}
+		await issueTracker.createIssueRelation({
+			issueId: manualIssue.id,
+			relatedIssueId: workflow.issueId,
+			type: "blocks",
+		});
+		const { blocker, created } = this.customWorkflow.addManualBlocker(
+			workflow.issueId,
+			{
+				key: input.key,
+				issueId: manualIssue.id,
+				issueIdentifier: manualIssue.identifier,
+				...(manualIssue.url ? { issueUrl: manualIssue.url } : {}),
+				verify: input.verify,
+			},
+		);
+		await this.savePersistedState(true);
+		await this.agentSessionManager.createThoughtActivity(
+			workflow.sessionId,
+			`Parked for human-only blocker ${blocker.issueUrl ? `[${blocker.issueIdentifier}](${blocker.issueUrl})` : blocker.issueIdentifier}. Work resumes only after Done and a successful non-secret verification.`,
+		);
+		const runner = this.agentSessionManager.getSession(
+			workflow.sessionId,
+		)?.agentRunner;
+		setTimeout(() => runner?.stop(), 0);
+		return {
+			issueIdentifier: blocker.issueIdentifier,
+			...(blocker.issueUrl ? { issueUrl: blocker.issueUrl } : {}),
+			created,
+		};
+	}
+
+	private async handleManualVerificationResult(input: {
+		sessionId: string;
+		blockerKey: string;
+		success: boolean;
+		result: string;
+	}): Promise<{ resumeImplementation: boolean }> {
+		assertNonSecretText(input.result);
+		const workflow = this.customWorkflow.getBySessionId(input.sessionId);
+		if (!workflow) throw new Error("Workflow is unavailable");
+		const outcome = this.customWorkflow.recordManualVerification(
+			workflow.issueId,
+			input.blockerKey,
+			input.success,
+			input.result,
+		);
+		await this.savePersistedState(true);
+		if (!input.success) {
+			await this.agentSessionManager.createErrorActivity(
+				workflow.sessionId,
+				`Manual verification failed and implementation remains blocked: ${input.result}`,
+			);
+		} else if (outcome.resumeImplementation) {
+			await this.agentSessionManager.createThoughtActivity(
+				workflow.sessionId,
+				"Manual blocker verification succeeded; the approved implementation will resume after the verifier turn exits.",
+			);
+		}
+		return outcome;
+	}
+
+	private async startManualVerification(
+		workflow: PersistentCustomWorkflow,
+	): Promise<void> {
+		const repository = this.repositories.get(workflow.repositoryId);
+		const issueTracker = this.issueTrackers.get(workflow.linearWorkspaceId);
+		const session = this.agentSessionManager.getSession(workflow.sessionId);
+		if (!repository || !issueTracker || !session) {
+			throw new Error(
+				`Cannot restore verification context for ${workflow.issueIdentifier}`,
+			);
+		}
+		const fullIssue = await issueTracker.fetchIssue(workflow.issueId);
+		const labels = await issueTracker.getIssueLabels(workflow.issueId);
+		const allowedDirectories = [
+			session.workspace.path,
+			repository.repositoryPath,
+			...this.gitService.getGitMetadataDirectoriesForWorkspace(
+				session.workspace,
+			),
+		];
+		const resumeSessionId =
+			session.claudeSessionId ??
+			session.geminiSessionId ??
+			session.codexSessionId ??
+			session.cursorSessionId ??
+			session.opencodeSessionId;
+		const pending = Object.values(workflow.manualBlockers).filter(
+			(blocker) => blocker.status === "verifying",
+		);
+		const prompt = pending
+			.map(
+				(blocker) =>
+					`Verify blocker ${blocker.key} (${blocker.issueIdentifier}) using only read-only inspection:\n${blocker.verify}\nThen call linear_manual_verification_result with the blocker key, success flag, and non-secret evidence.`,
+			)
+			.join("\n\n");
+		const { config, runnerType } = await this.buildAgentRunnerConfig(
+			session,
+			repository,
+			workflow.sessionId,
+			"Run only the specified non-secret, read-only verification. Do not modify files, run mutating commands, or expose credentials.",
+			[],
+			allowedDirectories,
+			[],
+			resumeSessionId,
+			labels,
+			fullIssue.description || undefined,
+			undefined,
+			workflow.linearWorkspaceId,
+			this.buildSkillSessionContext(repository, fullIssue, session),
+			"linear",
+			"manual_verification",
+		);
+		const runner = this.createRunnerForType(runnerType, config);
+		this.agentSessionManager.addAgentRunner(workflow.sessionId, runner);
+		await this.savePersistedState();
+		await runner.start(prompt);
+	}
+
+	private async resumeCustomImplementationAfterManual(
+		workflow: PersistentCustomWorkflow,
+		verificationResult: string,
+	): Promise<void> {
+		const repository = this.repositories.get(workflow.repositoryId);
+		const issueTracker = this.issueTrackers.get(workflow.linearWorkspaceId);
+		const session = this.agentSessionManager.getSession(workflow.sessionId);
+		if (!repository || !issueTracker || !session) return;
+		const fullIssue = await issueTracker.fetchIssue(workflow.issueId);
+		const labels = await issueTracker.getIssueLabels(workflow.issueId);
+		const attachmentsDir = join(
+			this.cyrusHome,
+			basename(session.workspace.path),
+			"attachments",
+		);
+		const allowedDirectories = [
+			attachmentsDir,
+			repository.repositoryPath,
+			...this.gitService.getGitMetadataDirectoriesForWorkspace(
+				session.workspace,
+			),
+		];
+		const resumeSessionId =
+			session.claudeSessionId ??
+			session.geminiSessionId ??
+			session.codexSessionId ??
+			session.cursorSessionId ??
+			session.opencodeSessionId;
+		const selected = await this.determineSystemPromptFromLabels(
+			labels,
+			repository,
+		);
+		const { config, runnerType } = await this.buildAgentRunnerConfig(
+			session,
+			repository,
+			workflow.sessionId,
+			`${selected?.prompt ?? ""}\n\n${this.customWorkflowImplementationAddendum()}`,
+			this.buildAllowedTools(repository, "builder"),
+			allowedDirectories,
+			[
+				...this.buildDisallowedTools(repository, "builder"),
+				"Bash(gh pr merge *)",
+				"Bash(gh api *pulls/*/merge*)",
+				"Bash(gt merge *)",
+				"Bash(git push * --delete *)",
+			],
+			resumeSessionId,
+			labels,
+			fullIssue.description || undefined,
+			undefined,
+			workflow.linearWorkspaceId,
+			this.buildSkillSessionContext(repository, fullIssue, session),
+			"linear",
+			"implementation",
+		);
+		this.customWorkflow.markImplementationResumed(workflow.issueId);
+		await this.savePersistedState(true);
+		const runner = this.createRunnerForType(runnerType, config);
+		this.agentSessionManager.addAgentRunner(workflow.sessionId, runner);
+		await this.savePersistedState();
+		await runner.start(
+			`The human-only blocker is complete and read-only verification passed:\n${verificationResult}\n\nResume the previously approved implementation plan from the existing isolated worktree.`,
+		);
+	}
+
+	private async handleMergeApprovalRequest(input: {
+		sessionId: string;
+		pullRequestNumber: number;
+		previewUrl?: string;
+	}): Promise<{ pullRequestUrl: string; headSha: string; created: boolean }> {
+		const workflow = this.customWorkflow.getBySessionId(input.sessionId);
+		if (!workflow || workflow.kind !== "feature") {
+			throw new Error(
+				"Protected merge is only available in approved Feature workflows",
+			);
+		}
+		const repository = this.repositories.get(workflow.repositoryId);
+		if (!repository?.githubUrl) {
+			throw new Error(
+				"Protected merge requires a configured GitHub repository",
+			);
+		}
+		const repositoryFullName = this.parseGitHubRepositoryFullName(
+			repository.githubUrl,
+		);
+		const token = await this.resolveGitHubTokenForRepository(repository);
+		if (!token)
+			throw new Error("No GitHub credential is available for protected merge");
+		if (!workflow.baseBranch || !workflow.branchName) {
+			throw new Error("Expected workflow branches are unavailable");
+		}
+		const inspection = await this.githubPullRequestService.inspect({
+			repositoryFullName,
+			pullRequestNumber: input.pullRequestNumber,
+			expectedBaseBranch: workflow.baseBranch,
+			expectedHeadBranch: workflow.branchName,
+			token,
+		});
+		if (inspection.merged && inspection.mergeCommitSha) {
+			const mergeCommitUrl = `${inspection.repositoryHtmlUrl}/commit/${inspection.mergeCommitSha}`;
+			this.customWorkflow.reconcileAlreadyMerged(
+				workflow.issueId,
+				{
+					repositoryId: repository.id,
+					repositoryFullName,
+					pullRequestNumber: inspection.pullRequestNumber,
+					pullRequestUrl: inspection.pullRequestUrl,
+					baseBranch: inspection.baseBranch,
+					headBranch: inspection.headBranch,
+					headSha: inspection.headSha,
+					changedFiles: inspection.changedFiles,
+					checks: inspection.checks,
+					...(input.previewUrl ? { previewUrl: input.previewUrl } : {}),
+				},
+				inspection.mergeCommitSha,
+				mergeCommitUrl,
+			);
+			await this.savePersistedState(true);
+			await this.agentSessionManager.createResponseActivity(
+				workflow.sessionId,
+				`Observed that [pull request #${inspection.pullRequestNumber}](${inspection.pullRequestUrl}) was already merged externally at [${inspection.mergeCommitSha.slice(0, 12)}](${mergeCommitUrl}); Cyrus did not issue another merge.`,
+			);
+			await this.moveIssueToCompletedState(
+				workflow.issueId,
+				workflow.linearWorkspaceId,
+			);
+			await this.startNextChildAndFinalizeParent(
+				workflow.parentWorkflowIssueId,
+			);
+			return {
+				pullRequestUrl: inspection.pullRequestUrl,
+				headSha: inspection.headSha,
+				created: false,
+			};
+		}
+		if (!inspection.open || inspection.failures.length > 0) {
+			throw new Error(
+				`Pull request is not eligible for approval: ${inspection.failures.join("; ") || "not open"}`,
+			);
+		}
+		const request = this.customWorkflow.requestMergeApproval(
+			workflow.issueId,
+			{
+				repositoryId: repository.id,
+				repositoryFullName,
+				pullRequestNumber: inspection.pullRequestNumber,
+				pullRequestUrl: inspection.pullRequestUrl,
+				baseBranch: inspection.baseBranch,
+				headBranch: inspection.headBranch,
+				headSha: inspection.headSha,
+				changedFiles: inspection.changedFiles,
+				checks: inspection.checks,
+				...(input.previewUrl ? { previewUrl: input.previewUrl } : {}),
+			},
+			`merge-request:${workflow.issueId}:${inspection.pullRequestNumber}:${inspection.headSha}`,
+		);
+		await this.savePersistedState(true);
+		if (request.accepted) {
+			await this.postMergeApprovalInteraction(workflow);
+			const runner = this.agentSessionManager.getSession(
+				workflow.sessionId,
+			)?.agentRunner;
+			setTimeout(() => runner?.stop(), 0);
+		}
+		return {
+			pullRequestUrl: request.approval.pullRequestUrl,
+			headSha: request.approval.headSha,
+			created: request.accepted,
+		};
+	}
+
+	private async postMergeApprovalInteraction(
+		workflow: PersistentCustomWorkflow,
+	): Promise<void> {
+		const approval = workflow.mergeApproval;
+		if (!approval) return;
+		const changedFiles = approval.changedFiles.length
+			? approval.changedFiles.map((file) => `- ${file}`).join("\n")
+			: "- No changed files reported";
+		const checks = approval.checks.length
+			? approval.checks
+					.map(
+						(check) =>
+							`- ${check.name}: ${check.status}${check.detailsUrl ? ` ([details](${check.detailsUrl}))` : ""}`,
+					)
+					.join("\n")
+			: "- No required checks configured; GitHub reports the commit eligible";
+		await this.agentSessionManager.createSelectElicitation(
+			workflow.sessionId,
+			`Protected merge approval\n\n- Repository: \`${approval.repositoryFullName}\`\n- Pull request: [#${approval.pullRequestNumber}](${approval.pullRequestUrl})\n- Base branch: \`${approval.baseBranch}\`\n- Head branch: \`${approval.headBranch}\`\n- Head SHA: \`${approval.headSha}\`${approval.previewUrl ? `\n- Preview: [open preview](${approval.previewUrl})` : ""}\n\nChanged files:\n${changedFiles}\n\nChecks:\n${checks}\n\nApproval authorizes only this exact repository, PR, branches, and head SHA. Cyrus will re-fetch all of them before merging.`,
+			this.customWorkflow.mergeDecisionOptions(workflow),
+		);
+	}
+
+	private async mergeApprovedPullRequest(
+		workflow: PersistentCustomWorkflow,
+	): Promise<void> {
+		const approval = workflow.mergeApproval;
+		const repository = this.repositories.get(workflow.repositoryId);
+		if (!approval || !repository?.githubUrl) {
+			throw new Error("Protected merge context is incomplete");
+		}
+		const token = await this.resolveGitHubTokenForRepository(repository);
+		if (!token)
+			throw new Error("No GitHub credential is available for protected merge");
+		try {
+			const merged = await this.githubPullRequestService.mergeApproved({
+				repositoryFullName: approval.repositoryFullName,
+				pullRequestNumber: approval.pullRequestNumber,
+				expectedBaseBranch: approval.baseBranch,
+				expectedHeadBranch: approval.headBranch,
+				expectedHeadSha: approval.headSha,
+				token,
+			});
+			this.customWorkflow.markMerged(
+				workflow.issueId,
+				merged.mergeCommitSha,
+				merged.mergeCommitUrl,
+			);
+			await this.savePersistedState(true);
+			await this.agentSessionManager.createResponseActivity(
+				workflow.sessionId,
+				`Merged [pull request #${approval.pullRequestNumber}](${merged.pullRequestUrl}) at [${merged.mergeCommitSha.slice(0, 12)}](${merged.mergeCommitUrl}).${merged.branchDeleted ? " The feature branch was deleted after merge." : ""}`,
+			);
+			await this.moveIssueToCompletedState(
+				workflow.issueId,
+				workflow.linearWorkspaceId,
+			);
+			await this.startNextChildAndFinalizeParent(
+				workflow.parentWorkflowIssueId,
+			);
+		} catch (error) {
+			if (error instanceof MergeRevalidationError) {
+				this.customWorkflow.markMergeStale(workflow.issueId, error.message);
+				await this.savePersistedState(true);
+				await this.agentSessionManager.createErrorActivity(
+					workflow.sessionId,
+					`${error.message}. Nothing was merged.${error.refreshApproval ? " Re-run checks and request a fresh merge approval for the current head." : ""}`,
+				);
+				return;
+			}
+			throw error;
+		}
+	}
+
+	private async resolveGitHubTokenForRepository(
+		repository: RepositoryConfig,
+	): Promise<string | undefined> {
+		if (repository.githubUrl) {
+			const stored = this.githubTokenStore.getTokenForRepoUrl(
+				repository.githubUrl,
+			);
+			if (stored) return stored;
+		}
+		if (this.gitHubAppTokenProvider) {
+			try {
+				return await this.gitHubAppTokenProvider.getToken();
+			} catch (error) {
+				this.logger.warn(
+					"Failed to mint GitHub App token for protected merge",
+					error instanceof Error ? error : new Error(String(error)),
+				);
+			}
+		}
+		return process.env.GITHUB_TOKEN;
+	}
+
+	private parseGitHubRepositoryFullName(repositoryUrl: string): string {
+		const normalized = repositoryUrl.replace(/\.git$/, "");
+		const sshMatch =
+			/^(?:git@|ssh:\/\/git@)github\.com[:/]([^/]+\/[^/]+)$/.exec(normalized);
+		if (sshMatch) return sshMatch[1]!;
+		const url = new URL(normalized);
+		if (url.hostname.toLowerCase() !== "github.com") {
+			throw new Error("Protected merge only supports github.com repositories");
+		}
+		const fullName = url.pathname.replace(/^\/+|\/+$/g, "");
+		if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(fullName)) {
+			throw new Error("Invalid GitHub repository URL");
+		}
+		return fullName;
+	}
+
+	private async startNextChildAndFinalizeParent(
+		parentIssueId: string | undefined,
+	): Promise<void> {
+		if (!parentIssueId) return;
+		const dependencyFailures =
+			this.customWorkflow.settleDependencyFailures(parentIssueId);
+		if (dependencyFailures.length > 0) {
+			await this.savePersistedState(true);
+			for (const issueId of dependencyFailures) {
+				const failed = this.customWorkflow.get(issueId);
+				if (!failed) continue;
+				this.agentSessionManager
+					.getSession(failed.sessionId)
+					?.agentRunner?.stop();
+				await this.agentSessionManager.createErrorActivity(
+					failed.sessionId,
+					"Implementation will not start because a required child dependency did not complete successfully.",
+				);
+				await this.moveIssueToCanceledState(
+					failed.issueId,
+					failed.linearWorkspaceId,
+				);
+			}
+		}
+		const nextIssueId =
+			this.customWorkflow.activateNextReadyChild(parentIssueId);
+		if (nextIssueId) {
+			const next = this.customWorkflow.get(nextIssueId);
+			if (next) await this.startApprovedFeatureImplementation(next);
+		}
+		await this.finalizeParentIfReady(parentIssueId);
+	}
+
+	private async finalizeParentIfReady(
+		parentIssueId: string | undefined,
+	): Promise<void> {
+		if (!parentIssueId) return;
+		const parent = this.customWorkflow.get(parentIssueId);
+		if (!parent || parent.phase === "done") return;
+		const completion = this.customWorkflow.getParentCompletion(parentIssueId);
+		if (!completion.complete) return;
+		this.customWorkflow.markParentDone(parentIssueId);
+		await this.savePersistedState(true);
+		await this.agentSessionManager.createResponseActivity(
+			parent.sessionId,
+			formatParentCompletionSummary(completion),
+		);
+		await this.moveIssueToCompletedState(
+			parent.issueId,
+			parent.linearWorkspaceId,
+		);
+	}
+
+	private async moveIssueToCompletedState(
+		issueId: string,
+		linearWorkspaceId: string,
+	): Promise<void> {
+		const issueTracker = this.issueTrackers.get(linearWorkspaceId);
+		if (!issueTracker) return;
+		const issue = await issueTracker.fetchIssue(issueId);
+		const currentState = await issue.state;
+		if (currentState?.type === "completed") return;
+		if (!issue.teamId) throw new Error(`Issue ${issue.identifier} has no team`);
+		const states = await issueTracker.fetchWorkflowStates(issue.teamId, {
+			first: 250,
+		});
+		const completed = states.nodes
+			.filter((state) => state.type === "completed")
+			.sort((left, right) => left.position - right.position)[0];
+		if (!completed) {
+			throw new Error(`Team ${issue.teamId} has no completed workflow state`);
+		}
+		await issueTracker.updateIssue(issueId, { stateId: completed.id });
+	}
+
+	private async moveIssueToCanceledState(
+		issueId: string,
+		linearWorkspaceId: string,
+	): Promise<void> {
+		const issueTracker = this.issueTrackers.get(linearWorkspaceId);
+		if (!issueTracker) return;
+		const issue = await issueTracker.fetchIssue(issueId);
+		const currentState = await issue.state;
+		if (currentState?.type === "canceled") return;
+		if (!issue.teamId) throw new Error(`Issue ${issue.identifier} has no team`);
+		const states = await issueTracker.fetchWorkflowStates(issue.teamId, {
+			first: 250,
+		});
+		const canceled = states.nodes
+			.filter((state) => state.type === "canceled")
+			.sort((left, right) => left.position - right.position)[0];
+		if (!canceled) {
+			throw new Error(`Team ${issue.teamId} has no canceled workflow state`);
+		}
+		await issueTracker.updateIssue(issueId, { stateId: canceled.id });
+	}
+
 	/**
 	 * Handle stop signal from prompted webhook
 	 * Branch 1 of agentSessionPrompted (see packages/CLAUDE.md)
@@ -5073,6 +6249,21 @@ ${taskSection}`;
 			agentSession.issue,
 			webhook.organizationId,
 		);
+
+		// Repository selection is an intermediate routing step. A delegated
+		// Product/PRD or Feature issue must still enter the persistent planning
+		// gate after the repository has been chosen instead of falling through to
+		// the legacy builder initialization path.
+		if (
+			await this.tryStartCustomWorkflowPlanning(
+				agentSession,
+				[repository],
+				webhook.organizationId,
+				commentBody,
+			)
+		) {
+			return;
+		}
 
 		// Initialize agent runner with the selected repository (wrapped in array)
 		// routingMethod="user-selected" will be included in the combined routing activity
@@ -5372,6 +6563,13 @@ ${taskSection}`;
 			return;
 		}
 
+		// Persistent plan/merge decisions are handled before normal continuation.
+		// This prevents a free-form reply or a stale interaction from accidentally
+		// becoming an implementation prompt.
+		if (await this.handleCustomWorkflowPrompted(webhook)) {
+			return;
+		}
+
 		// Branch 1.5: Handle re-prompt for parked (blocked-by) sessions
 		// When a user re-prompts and the session is parked, re-check blocking status.
 		// If blockers are resolved, wake the session immediately.
@@ -5495,6 +6693,162 @@ ${taskSection}`;
 		await this.handleNormalPromptedActivity(webhook, repositories);
 	}
 
+	private async handleCustomWorkflowPrompted(
+		webhook: AgentSessionPromptedWebhook,
+	): Promise<boolean> {
+		const issueId = webhook.agentSession.issue?.id;
+		if (!issueId) return false;
+		const workflow = this.customWorkflow.get(issueId);
+		if (!workflow) return false;
+
+		const guardedPhases = new Set([
+			"planning",
+			"awaiting_plan_approval",
+			"orchestrating",
+			"approved_waiting",
+			"blocked_manual",
+			"verifying_manual",
+			"manual_verified",
+			"awaiting_merge_approval",
+			"merging",
+		]);
+		if (!guardedPhases.has(workflow.phase)) return false;
+
+		const repository = this.repositories.get(workflow.repositoryId);
+		const rawActivity = webhook.agentActivity as unknown as {
+			id?: string;
+			userId?: string;
+			content?: {
+				body?: string;
+				user?: { id?: string; email?: string; name?: string };
+			};
+		};
+		const embeddedActor = rawActivity?.content?.user;
+		const actorId = rawActivity?.userId ?? embeddedActor?.id;
+		let actorEmail = embeddedActor?.email;
+		if (actorId && !actorEmail) {
+			const issueTracker = this.issueTrackers.get(workflow.linearWorkspaceId);
+			try {
+				actorEmail = (await issueTracker?.fetchUser(actorId))?.email;
+			} catch (error) {
+				this.logger.warn(
+					`Could not resolve approval responder ${actorId} for access control`,
+					error instanceof Error ? error : new Error(String(error)),
+				);
+			}
+		}
+		const authorized = Boolean(
+			repository &&
+				actorId &&
+				this.userAccessControl.checkAccess(actorId, actorEmail, repository.id)
+					.allowed,
+		);
+		const body = rawActivity?.content?.body ?? "";
+		const deliveryId =
+			rawActivity?.id ??
+			`prompt:${workflow.sessionId}:${String(webhook.createdAt)}:${body}`;
+
+		if (workflow.phase === "awaiting_plan_approval") {
+			const decision = this.customWorkflow.handlePlanDecision({
+				issueId,
+				sessionId: webhook.agentSession.id,
+				body,
+				userId: actorId ?? "missing-user",
+				authorized,
+				deliveryId,
+			});
+			if (!decision.accepted) {
+				await this.agentSessionManager.createThoughtActivity(
+					workflow.sessionId,
+					authorized
+						? `No workflow action was taken (${decision.reason ?? "an explicit correlated decision is required"}). The plan remains parked.`
+						: "No workflow action was taken because the responding identity is not authorized.",
+				);
+				return true;
+			}
+			await this.savePersistedState(true);
+			if (decision.decision === "revise") {
+				await this.startCustomPlanningRunner(
+					workflow,
+					undefined,
+					undefined,
+					decision.revisionFeedback,
+				);
+			} else if (decision.effect === "decompose") {
+				await this.decomposeApprovedParent(workflow);
+			} else if (decision.effect === "start_implementation") {
+				await this.startApprovedFeatureImplementation(workflow);
+			} else if (decision.effect === "finish_parent") {
+				await this.agentSessionManager.createResponseActivity(
+					workflow.sessionId,
+					"Approved plan requires no implementation children. The product workflow is complete.",
+				);
+				await this.moveIssueToCompletedState(
+					workflow.issueId,
+					workflow.linearWorkspaceId,
+				);
+			} else if (decision.effect === "terminal") {
+				await this.agentSessionManager.createResponseActivity(
+					workflow.sessionId,
+					`Workflow ${decision.decision}; no implementation was started.`,
+				);
+				await this.moveIssueToCanceledState(
+					workflow.issueId,
+					workflow.linearWorkspaceId,
+				);
+				await this.startNextChildAndFinalizeParent(
+					workflow.parentWorkflowIssueId,
+				);
+			}
+			return true;
+		}
+
+		if (workflow.phase === "awaiting_merge_approval") {
+			const decision = this.customWorkflow.handleMergeDecision({
+				issueId,
+				sessionId: webhook.agentSession.id,
+				body,
+				userId: actorId ?? "missing-user",
+				authorized,
+				deliveryId,
+			});
+			if (!decision.accepted) {
+				await this.agentSessionManager.createThoughtActivity(
+					workflow.sessionId,
+					authorized
+						? `No merge action was taken (${decision.reason ?? "an explicit correlated decision is required"}).`
+						: "No merge action was taken because the responding identity is not authorized.",
+				);
+				return true;
+			}
+			await this.savePersistedState(true);
+			if (decision.effect === "merge") {
+				await this.mergeApprovedPullRequest(workflow);
+			} else {
+				await this.agentSessionManager.createResponseActivity(
+					workflow.sessionId,
+					`Merge ${decision.decision}; the pull request remains open and unmerged.`,
+				);
+				if (decision.effect === "terminal") {
+					await this.moveIssueToCanceledState(
+						workflow.issueId,
+						workflow.linearWorkspaceId,
+					);
+					await this.startNextChildAndFinalizeParent(
+						workflow.parentWorkflowIssueId,
+					);
+				}
+			}
+			return true;
+		}
+
+		await this.agentSessionManager.createThoughtActivity(
+			workflow.sessionId,
+			`This workflow is currently ${workflow.phase.replaceAll("_", " ")}; the message did not bypass its persistent gate.`,
+		);
+		return true;
+	}
+
 	/**
 	 * Handle issue unassignment
 	 * @param issue Linear issue object from webhook data
@@ -5539,6 +6893,172 @@ ${taskSection}`;
 		_repositoryId: string,
 	): Promise<void> {
 		await this.agentSessionManager.handleClaudeMessage(sessionId, message);
+	}
+
+	private async handleCustomWorkflowRunnerResult(
+		sessionId: string,
+		resultMessage: SDKResultMessage,
+	): Promise<{ suppressParentResume?: boolean } | undefined> {
+		const workflow = this.customWorkflow.getBySessionId(sessionId);
+		if (!workflow) return;
+		const result =
+			"result" in resultMessage && typeof resultMessage.result === "string"
+				? resultMessage.result.trim()
+				: "";
+
+		if (workflow.phase === "planning") {
+			if (resultMessage.subtype !== "success" || !result) {
+				this.customWorkflow.markFailed(
+					workflow.issueId,
+					"Read-only planning did not produce a usable plan",
+				);
+				await this.savePersistedState(true);
+				await this.agentSessionManager.createErrorActivity(
+					sessionId,
+					"Read-only planning ended without a usable plan; no implementation was started.",
+				);
+				await this.moveIssueToCanceledState(
+					workflow.issueId,
+					workflow.linearWorkspaceId,
+				);
+				await this.startNextChildAndFinalizeParent(
+					workflow.parentWorkflowIssueId,
+				);
+				return { suppressParentResume: true };
+			}
+			try {
+				const completion = this.customWorkflow.completePlanning(
+					workflow.issueId,
+					result,
+					`plan-result:${workflow.issueId}:${workflow.planRevision + 1}:${resultMessage.session_id}`,
+				);
+				await this.savePersistedState(true);
+				if (completion.accepted) {
+					await this.postPlanApprovalInteraction(completion.workflow);
+				}
+			} catch (error) {
+				await this.agentSessionManager.createErrorActivity(
+					sessionId,
+					`The planner response could not be turned into an approval request: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`,
+				);
+			}
+			return { suppressParentResume: true };
+		}
+
+		if (workflow.phase === "implementing") {
+			if (resultMessage.subtype === "success") {
+				this.customWorkflow.markInReview(
+					workflow.issueId,
+					result || "Implementation runner completed",
+				);
+				await this.agentSessionManager.createThoughtActivity(
+					sessionId,
+					"Implementation is in review. Cyrus will only offer merge approval after a pull request exists and all checks pass.",
+				);
+			} else {
+				this.customWorkflow.markFailed(
+					workflow.issueId,
+					result || `Implementation failed (${resultMessage.subtype})`,
+				);
+			}
+			await this.savePersistedState(true);
+			if (resultMessage.subtype !== "success") {
+				await this.moveIssueToCanceledState(
+					workflow.issueId,
+					workflow.linearWorkspaceId,
+				);
+				await this.startNextChildAndFinalizeParent(
+					workflow.parentWorkflowIssueId,
+				);
+			}
+			return { suppressParentResume: true };
+		}
+
+		if (workflow.phase === "manual_verified") {
+			await this.resumeCustomImplementationAfterManual(
+				workflow,
+				this.manualVerificationSummary(workflow),
+			);
+			return { suppressParentResume: true };
+		}
+
+		if (workflow.phase === "verifying_manual") {
+			for (const blocker of Object.values(workflow.manualBlockers)) {
+				if (blocker.status !== "verifying") continue;
+				this.customWorkflow.recordManualVerification(
+					workflow.issueId,
+					blocker.key,
+					false,
+					"Verification runner ended without reporting a result",
+				);
+			}
+			await this.savePersistedState(true);
+			await this.agentSessionManager.createErrorActivity(
+				sessionId,
+				"Manual verification ended without a result; implementation remains blocked.",
+			);
+			return { suppressParentResume: true };
+		}
+
+		return { suppressParentResume: true };
+	}
+
+	private manualVerificationSummary(
+		workflow: PersistentCustomWorkflow,
+	): string {
+		return Object.values(workflow.manualBlockers)
+			.filter((blocker) => blocker.status === "verified")
+			.map(
+				(blocker) =>
+					`${blocker.issueIdentifier}: ${blocker.verificationResult ?? "verified"}`,
+			)
+			.join("\n");
+	}
+
+	private async postPlanApprovalInteraction(
+		workflow: PersistentCustomWorkflow,
+	): Promise<void> {
+		const approval = workflow.planApproval;
+		if (!approval) return;
+		await this.agentSessionManager.createSelectElicitation(
+			workflow.sessionId,
+			`Review plan revision ${approval.revision} above. Implementation and child creation remain parked until an authorized user explicitly chooses an option. Choose Revise and add feedback after the selected value to replace the plan.`,
+			this.customWorkflow.planDecisionOptions(workflow),
+		);
+	}
+
+	private async recoverCustomWorkflowInteractions(): Promise<void> {
+		for (const workflow of this.customWorkflow.list()) {
+			if (workflow.phase === "planning") {
+				await this.startCustomPlanningRunner(workflow);
+			} else if (
+				workflow.phase === "awaiting_plan_approval" &&
+				workflow.planApproval?.status === "pending"
+			) {
+				await this.postPlanApprovalInteraction(workflow);
+			} else if (
+				workflow.phase === "awaiting_merge_approval" &&
+				workflow.mergeApproval?.status === "pending"
+			) {
+				await this.postMergeApprovalInteraction(workflow);
+			} else if (workflow.phase === "orchestrating") {
+				await this.decomposeApprovedParent(workflow);
+			} else if (
+				workflow.phase === "approved_waiting" &&
+				this.customWorkflow.isFeatureReady(workflow.issueId)
+			) {
+				await this.startApprovedFeatureImplementation(workflow);
+			} else if (workflow.phase === "verifying_manual") {
+				await this.startManualVerification(workflow);
+			} else if (workflow.phase === "manual_verified") {
+				await this.resumeCustomImplementationAfterManual(
+					workflow,
+					this.manualVerificationSummary(workflow),
+				);
+			} else if (workflow.phase === "merging") {
+				await this.mergeApprovedPullRequest(workflow);
+			}
+		}
 	}
 
 	/**
@@ -6238,6 +7758,12 @@ ${taskSection}`;
 					message,
 				);
 			},
+			onManualBlockerRequested: (input) =>
+				this.handleManualBlockerRequest(input),
+			onManualVerificationResult: (input) =>
+				this.handleManualVerificationResult(input),
+			onMergeApprovalRequested: (input) =>
+				this.handleMergeApprovalRequest(input),
 		};
 		if (failureModesClient) {
 			options.failureModes = {
@@ -6863,6 +8389,7 @@ ${input.userComment}
 		 * Defaults to `"linear"` (the pre-platform-aware behavior).
 		 */
 		sessionPlatform: "linear" | "github" | "gitlab" = "linear",
+		workflowMode?: "implementation" | "planning" | "manual_verification",
 	): Promise<{ config: AgentRunnerConfig; runnerType: RunnerType }> {
 		const log = this.logger.withContext({
 			sessionId,
@@ -6923,6 +8450,7 @@ ${input.userComment}
 			opencodeGlobalStateScope: this.config.opencode?.stateScope,
 			skills: allowedSkillNames,
 			sandboxSettings: this.sdkSandboxSettings ?? undefined,
+			workflowMode,
 			egressCaCertPath: this.egressCaCertPath ?? undefined,
 			onMessage: (message: SDKMessage) => {
 				this.handleClaudeMessage(sessionId, message, repository.id);
@@ -7109,6 +8637,7 @@ ${input.userComment}
 			const state = await this.persistenceManager.loadEdgeWorkerState();
 			if (state) {
 				this.restoreMappings(state);
+				await this.recoverCustomWorkflowInteractions();
 				this.logger.debug(
 					`✅ Loaded persisted EdgeWorker state with ${Object.keys(state.agentSessions || {}).length} sessions`,
 				);
@@ -7281,7 +8810,7 @@ ${input.userComment}
 	/**
 	 * Save current EdgeWorker state for all repositories
 	 */
-	private async savePersistedState(): Promise<void> {
+	private async savePersistedState(required = false): Promise<void> {
 		try {
 			const state = this.serializeMappings();
 			await this.persistenceManager.saveEdgeWorkerState(state);
@@ -7289,12 +8818,22 @@ ${input.userComment}
 				`✅ Saved EdgeWorker state for ${Object.keys(state.agentSessions || {}).length} sessions`,
 			);
 		} catch (error) {
-			this.logger.error(`Failed to save persisted EdgeWorker state:`, error);
+			const safeMessage = redactSensitiveText(
+				error instanceof Error ? error.message : String(error),
+			);
+			this.logger.error(
+				`Failed to save persisted EdgeWorker state: ${safeMessage}`,
+			);
+			if (required) {
+				throw new Error(
+					"The workflow state could not be saved durably; no gated follow-up action was started",
+				);
+			}
 		}
 	}
 
 	/**
-	 * Serialize EdgeWorker mappings to a serializable format (v4.0 flat format)
+	 * Serialize EdgeWorker mappings to the v5.0 flat format with custom workflow state.
 	 */
 	public serializeMappings(): SerializableEdgeWorkerState {
 		// Serialize Agent Session state - flat structure from single ASM
@@ -7314,13 +8853,15 @@ ${input.userComment}
 			agentSessionEntries: serializedState.entries,
 			childToParentAgentSession,
 			issueRepositoryCache,
+			customWorkflow: this.customWorkflow.serialize(),
 		};
 	}
 
 	/**
-	 * Restore EdgeWorker mappings from serialized state (v4.0 flat format)
+	 * Restore EdgeWorker mappings from the v5.0 flat format.
 	 */
 	public restoreMappings(state: SerializableEdgeWorkerState): void {
+		this.customWorkflow.restore(state.customWorkflow);
 		// Restore Agent Session state from flat format
 		if (state.agentSessions && state.agentSessionEntries) {
 			this.agentSessionManager.restoreState(

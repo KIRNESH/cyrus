@@ -186,7 +186,40 @@ export interface IssueRunnerConfigInput {
 	 * `gh auth login` the github-tokens push handler performs.
 	 */
 	githubToken?: string;
+	/**
+	 * Workflow permission boundary. Planning and Manual verification are
+	 * deliberately read-only regardless of repository/global tool defaults.
+	 */
+	workflowMode?: "implementation" | "planning" | "manual_verification";
 }
+
+export const WORKFLOW_READ_ONLY_TOOLS = [
+	"Read(**)",
+	"WebFetch",
+	"WebSearch",
+	"LSP",
+	"ToolSearch",
+] as const;
+
+export const WORKFLOW_MUTATION_TOOLS = [
+	"Edit(**)",
+	"Write(**)",
+	"Bash",
+	"NotebookEdit",
+	"EnterWorktree",
+	"ExitWorktree",
+	"Task",
+	"TaskCreate",
+	"TaskUpdate",
+	"SendMessage",
+	"PushNotification",
+	"CronCreate",
+	"CronDelete",
+	"ScheduleWakeup",
+	"RemoteTrigger",
+	"Workflow",
+	"DesignSync",
+] as const;
 
 export function resolveIssueMcpConfigPath(
 	repository: RepositoryConfig,
@@ -349,6 +382,26 @@ export class RunnerConfigBuilder {
 		runnerType: RunnerType;
 	} {
 		const log = input.logger;
+		const readOnlyWorkflow =
+			input.workflowMode === "planning" ||
+			input.workflowMode === "manual_verification";
+		const workflowAllowedTools = readOnlyWorkflow
+			? [
+					...WORKFLOW_READ_ONLY_TOOLS,
+					...(input.workflowMode === "manual_verification"
+						? ["mcp__cyrus-tools__linear_manual_verification_result"]
+						: []),
+				]
+			: input.allowedTools;
+		const workflowDisallowedTools = readOnlyWorkflow
+			? [
+					...new Set([...input.disallowedTools, ...WORKFLOW_MUTATION_TOOLS]),
+				].filter(
+					(tool) =>
+						input.workflowMode !== "manual_verification" ||
+						tool !== "mcp__cyrus-tools__linear_manual_verification_result",
+				)
+			: input.disallowedTools;
 
 		// Configure hooks: PostToolUse for screenshot tools + PR-marker enforcement,
 		// plus the Stop hook that blocks the session when work is unshipped.
@@ -356,14 +409,17 @@ export class RunnerConfigBuilder {
 		const prMarkerHook = buildPrMarkerHook(log);
 		const intentToAddHook = buildIntentToAddHook(log);
 		const stopHook = this.buildStopHook(log);
-		const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
-			...stopHook,
-			PostToolUse: [
-				...(screenshotHooks.PostToolUse ?? []),
-				...(prMarkerHook.PostToolUse ?? []),
-				...(intentToAddHook.PostToolUse ?? []),
-			],
-		};
+		const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> =
+			readOnlyWorkflow
+				? {}
+				: {
+						...stopHook,
+						PostToolUse: [
+							...(screenshotHooks.PostToolUse ?? []),
+							...(prMarkerHook.PostToolUse ?? []),
+							...(intentToAddHook.PostToolUse ?? []),
+						],
+					};
 
 		// Determine runner type and model override from selectors
 		const runnerSelection = this.runnerSelector.determineRunnerSelection(
@@ -451,8 +507,8 @@ export class RunnerConfigBuilder {
 
 		const config: AgentRunnerConfig & Record<string, unknown> = {
 			workingDirectory: cwd,
-			allowedTools: input.allowedTools,
-			disallowedTools: input.disallowedTools,
+			allowedTools: workflowAllowedTools,
+			disallowedTools: workflowDisallowedTools,
 			allowedDirectories: input.allowedDirectories,
 			...(additionalDirectories.length > 0 && { additionalDirectories }),
 			workspaceName: input.session.issue?.identifier || input.session.issueId,
@@ -545,9 +601,27 @@ export class RunnerConfigBuilder {
 		// app-server permission profile (read/write allow-list).
 		if (runnerType === "codex" && input.sandboxSettings) {
 			config.sandboxSettings = {
-				allowWrite: [input.session.workspace.path],
+				allowWrite: readOnlyWorkflow ? [] : [input.session.workspace.path],
 				allowRead: [input.session.workspace.path, ...input.allowedDirectories],
 			};
+		}
+		if (runnerType === "codex" && readOnlyWorkflow) {
+			// Codex native shell/file tools are governed by its filesystem sandbox,
+			// not Claude-style allowedTools. Force a read-only thread even when the
+			// global egress sandbox is disabled.
+			config.sandbox = "read-only";
+			config.sandboxSettings = {
+				allowWrite: [],
+				allowRead: [input.session.workspace.path, ...input.allowedDirectories],
+			};
+			if (input.workflowMode === "planning") {
+				// A filesystem-only read-only sandbox would still let a shell command
+				// mutate GitHub or another remote API. Planning needs no outbound
+				// network access, so close that path as part of the Codex profile.
+				config.configOverrides = {
+					sandbox_workspace_write: { network_access: false },
+				};
+			}
 		}
 
 		if (input.resumeSessionId) {
@@ -608,7 +682,11 @@ export class RunnerConfigBuilder {
 					allowRead: [".", ...input.allowedDirectories],
 					denyRead: ["~/"],
 					// Restrict subprocess writes to the session worktree only
-					allowWrite: [input.session.workspace.path],
+					allowWrite:
+						input.workflowMode === "planning" ||
+						input.workflowMode === "manual_verification"
+							? []
+							: [input.session.workspace.path],
 				},
 			};
 		}

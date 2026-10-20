@@ -32,6 +32,11 @@ const sampleState: SerializableEdgeWorkerState = {
 	agentSessionEntries: { "session-1": [] },
 	childToParentAgentSession: {},
 	issueRepositoryCache: { "issue-1": ["repo-1"] },
+	customWorkflow: {
+		version: 1,
+		workflows: {},
+		processedDeliveries: { "activity-1": 1 },
+	},
 };
 
 function stubLogger(): ILogger {

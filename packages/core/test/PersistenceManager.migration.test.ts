@@ -1,5 +1,5 @@
 /**
- * Tests for PersistenceManager migrations (v2.0 → v3.0 → v4.0)
+ * Tests for PersistenceManager migrations (v2.0 → v3.0 → v4.0 → v5.0)
  */
 
 import { existsSync } from "node:fs";
@@ -30,7 +30,7 @@ describe("PersistenceManager", () => {
 		persistenceManager = new PersistenceManager("/tmp/test-cyrus");
 	});
 
-	describe("v2.0 to v4.0 Migration (via v3.0)", () => {
+	describe("v2.0 to v5.0 Migration (via v3.0/v4.0)", () => {
 		const v2State = {
 			version: "2.0",
 			savedAt: "2025-01-15T12:00:00.000Z",
@@ -79,7 +79,7 @@ describe("PersistenceManager", () => {
 			},
 		};
 
-		it("should migrate v2.0 state through v3.0 to v4.0 flat format", async () => {
+		it("should migrate v2.0 state through v3.0 to the v5.0 flat format", async () => {
 			vi.mocked(existsSync).mockReturnValue(true);
 			vi.mocked(readFile).mockResolvedValue(JSON.stringify(v2State));
 			vi.mocked(writeFile).mockResolvedValue(undefined);
@@ -128,7 +128,7 @@ describe("PersistenceManager", () => {
 			]);
 		});
 
-		it("should save migrated state as v4.0", async () => {
+		it("should save migrated state as v5.0", async () => {
 			vi.mocked(existsSync).mockReturnValue(true);
 			vi.mocked(readFile).mockResolvedValue(JSON.stringify(v2State));
 			vi.mocked(writeFile).mockResolvedValue(undefined);
@@ -205,7 +205,7 @@ describe("PersistenceManager", () => {
 		});
 	});
 
-	describe("v3.0 to v4.0 Migration", () => {
+	describe("v3.0 to v5.0 Migration", () => {
 		const v3State = {
 			version: "3.0",
 			savedAt: "2025-01-15T12:00:00.000Z",
@@ -335,7 +335,7 @@ describe("PersistenceManager", () => {
 			});
 		});
 
-		it("should save migrated v3→v4 state with correct version", async () => {
+		it("should save migrated v3 state with the current version", async () => {
 			vi.mocked(existsSync).mockReturnValue(true);
 			vi.mocked(readFile).mockResolvedValue(JSON.stringify(v3State));
 			vi.mocked(writeFile).mockResolvedValue(undefined);
@@ -347,12 +347,12 @@ describe("PersistenceManager", () => {
 			const savedData = JSON.parse(
 				vi.mocked(writeFile).mock.calls[0][1] as string,
 			);
-			expect(savedData.version).toBe("4.0");
+			expect(savedData.version).toBe("5.0");
 		});
 	});
 
-	describe("v4.0 state (current)", () => {
-		it("should load v4.0 state without migration", async () => {
+	describe("v4.0 to v5.0 Migration", () => {
+		it("loads existing state with a backward-compatible empty workflow default", async () => {
 			const v4State = {
 				version: "4.0",
 				savedAt: "2025-01-15T12:00:00.000Z",
@@ -377,14 +377,18 @@ describe("PersistenceManager", () => {
 			const result = await persistenceManager.loadEdgeWorkerState();
 
 			expect(result).toEqual(v4State.state);
-			// Should not call writeFile since no migration needed
-			expect(writeFile).not.toHaveBeenCalled();
+			expect(result?.customWorkflow).toBeUndefined();
+			expect(writeFile).toHaveBeenCalled();
+			const savedData = JSON.parse(
+				vi.mocked(writeFile).mock.calls[0][1] as string,
+			);
+			expect(savedData.version).toBe("5.0");
 		});
 	});
 
 	describe("PERSISTENCE_VERSION constant", () => {
-		it("should be 4.0", () => {
-			expect(PERSISTENCE_VERSION).toBe("4.0");
+		it("should be 5.0", () => {
+			expect(PERSISTENCE_VERSION).toBe("5.0");
 		});
 	});
 });

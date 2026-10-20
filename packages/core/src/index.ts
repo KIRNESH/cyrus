@@ -119,6 +119,24 @@ export {
 	getDefaultReposDir,
 	getDefaultWorktreesDir,
 } from "./constants.js";
+export type {
+	CustomWorkflowKind,
+	CustomWorkflowPhase,
+	CustomWorkflowTerminalPhase,
+	ManualBlockerRecord,
+	PersistentChildResult,
+	PersistentCustomWorkflow,
+	PersistentCustomWorkflowState,
+	PlanApprovalRecord,
+	PlannedChildSpec,
+	PullRequestApprovalRecord,
+	PullRequestCheckResult,
+} from "./custom-workflow.js";
+export {
+	CUSTOM_WORKFLOW_STATE_VERSION,
+	createEmptyCustomWorkflowState,
+	isCustomWorkflowTerminal,
+} from "./custom-workflow.js";
 // GitHub App installation token store (multi-org GitHub support)
 export type {
 	GitHubInstallationToken,
@@ -157,8 +175,11 @@ export type {
 	IAgentEventTransport,
 	IIssueTrackerService,
 	Issue,
+	IssueCreateInput,
 	IssueDeletedWebhook,
 	IssueRelation,
+	IssueRelationCreateInput,
+	IssueRelationCreateResult,
 	IssueStateChangeWebhook,
 	IssueUnassignedWebhook,
 	IssueUpdateInput,
