@@ -20,6 +20,7 @@ function build(
 	runnerType: "claude" | "codex",
 	workflowMode: "planning" | "manual_verification" | "implementation",
 	sandbox = false,
+	sandboxWritablePaths?: string[],
 ) {
 	const tools: IChatToolResolver = {
 		buildChatAllowedTools: () => [],
@@ -74,13 +75,16 @@ function build(
 		onError: () => {},
 		requireLinearWorkspaceId: () => "workspace-1",
 		workflowMode,
+		...(sandboxWritablePaths ? { sandboxWritablePaths } : {}),
 		...(sandbox ? { sandboxSettings: { enabled: true } } : {}),
 	}).config as Record<string, unknown>;
 }
 
 describe("RunnerConfigBuilder custom workflow permissions", () => {
 	it("prevents every repository mutation path in Claude planning mode", () => {
-		const config = build("claude", "planning", true);
+		const config = build("claude", "planning", true, [
+			"/home/operator/.supabase",
+		]);
 		expect(config.allowedTools).toEqual([...WORKFLOW_READ_ONLY_TOOLS]);
 		for (const mutation of WORKFLOW_MUTATION_TOOLS) {
 			expect(config.disallowedTools).toContain(mutation);

@@ -176,6 +176,12 @@ export interface IssueRunnerConfigInput {
 	/** CA cert path for MITM TLS termination — passed via child process env */
 	egressCaCertPath?: string;
 	/**
+	 * Operator-whitelisted extra writable paths (absolute), from
+	 * `sandbox.writablePaths` / `CYRUS_SANDBOX_WRITABLE_PATHS`. Always applied
+	 * for Codex; applied for Claude when the egress sandbox is enabled.
+	 */
+	sandboxWritablePaths?: string[];
+	/**
 	 * GitHub App installation token matched to the session repository's org
 	 * (from the cyrus-hosted-pushed token store). When set, it's exposed to
 	 * the session ONLY as `CYRUS_GH_TOKEN` — the droplet's gh wrapper maps
@@ -624,6 +630,41 @@ export class RunnerConfigBuilder {
 			}
 		}
 
+		// Operator-whitelisted extra writable paths (e.g. `~/.supabase`). Codex
+		// adds these as writable roots in both its default workspace-write mode
+		// and the egress-sandbox profile, so containment is otherwise unchanged.
+		if (runnerType === "codex" && input.sandboxWritablePaths?.length) {
+			config.writableRoots = input.sandboxWritablePaths;
+		}
+
+		// Claude with the egress sandbox: the OS sandbox side is handled in
+		// buildSandboxConfig. On the tool-permission side, treat the paths as
+		// allowed directories (Read allow + exemption from the home-directory
+		// Read denylist) and grant Edit/Write on them — but only when the
+		// session already has Edit/Write, so read-only tool sets stay read-only.
+		if (
+			runnerType === "claude" &&
+			input.sandboxSettings &&
+			input.sandboxWritablePaths?.length
+		) {
+			const extra = input.sandboxWritablePaths;
+			config.allowedDirectories = [...input.allowedDirectories, ...extra];
+			const hasTool = (name: string) =>
+				workflowAllowedTools.some(
+					(t) => t === name || t.startsWith(`${name}(`),
+				);
+			const writeTools = ["Edit", "Write"].filter(hasTool);
+			if (writeTools.length > 0) {
+				// Absolute paths need an extra leading `/` in Claude tool patterns.
+				config.allowedTools = [
+					...workflowAllowedTools,
+					...writeTools.flatMap((tool) =>
+						extra.map((p) => `${tool}(/${p}/**)`),
+					),
+				];
+			}
+		}
+
 		if (input.resumeSessionId) {
 			config.resumeSessionId = input.resumeSessionId;
 		}
@@ -679,14 +720,24 @@ export class RunnerConfigBuilder {
 					// See: https://code.claude.com/docs/en/settings#sandbox-path-prefixes
 					// allowedDirectories contains the attachments dir, repo paths, and git
 					// metadata dirs — all of which need OS-level read access alongside the worktree.
-					allowRead: [".", ...input.allowedDirectories],
+					// Operator-whitelisted writable paths (sandbox.writablePaths) are
+					// also readable, carving them out of the `~/` deny.
+					allowRead: [
+						".",
+						...input.allowedDirectories,
+						...(input.sandboxWritablePaths ?? []),
+					],
 					denyRead: ["~/"],
-					// Restrict subprocess writes to the session worktree only
+					// Planning and manual verification remain read-only. Other sessions
+					// may write to the worktree plus operator-whitelisted paths.
 					allowWrite:
 						input.workflowMode === "planning" ||
 						input.workflowMode === "manual_verification"
 							? []
-							: [input.session.workspace.path],
+							: [
+									input.session.workspace.path,
+									...(input.sandboxWritablePaths ?? []),
+								],
 				},
 			};
 		}
