@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionManager } from "../src/AgentSessionManager";
 
 describe("AgentSessionManager.getSessionsByBaseBranch", () => {
@@ -209,5 +209,39 @@ describe("AgentSessionManager.getSessionsByBaseBranch", () => {
 
 		const sessions = manager.getSessionsByBaseBranch("main", "repo-a");
 		expect(sessions).toHaveLength(0);
+	});
+
+	it("clears provider continuation state before a fresh planning retry", () => {
+		const session = manager.createCyrusAgentSession(
+			"session-retry",
+			"issue-retry",
+			{
+				id: "issue-retry",
+				identifier: "TEST-RETRY",
+				title: "Retry planning",
+				description: "test",
+				branchName: "test-retry",
+			},
+			{ path: "/tmp/retry", isGitWorktree: false },
+		);
+		const stop = vi.fn();
+		session.agentRunner = {
+			stop,
+		} as unknown as NonNullable<typeof session.agentRunner>;
+		session.claudeSessionId = "claude-old";
+		session.geminiSessionId = "gemini-old";
+		session.codexSessionId = "codex-old";
+		session.cursorSessionId = "cursor-old";
+		session.opencodeSessionId = "opencode-old";
+
+		const reset = manager.resetRunnerContinuation("session-retry");
+
+		expect(stop).toHaveBeenCalledOnce();
+		expect(reset.agentRunner).toBeUndefined();
+		expect(reset.claudeSessionId).toBeUndefined();
+		expect(reset.geminiSessionId).toBeUndefined();
+		expect(reset.codexSessionId).toBeUndefined();
+		expect(reset.cursorSessionId).toBeUndefined();
+		expect(reset.opencodeSessionId).toBeUndefined();
 	});
 });

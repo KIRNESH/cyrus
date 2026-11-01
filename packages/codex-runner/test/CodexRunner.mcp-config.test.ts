@@ -100,6 +100,50 @@ describe("CodexRunner MCP config mapping", () => {
 		expect(mcpServers["cyrus-tools"].tools).toBeUndefined();
 	});
 
+	it("omits every MCP server when an explicit allow-list contains no MCP tools", () => {
+		const mcpServers = buildCodexMcpServersConfig({
+			workingDirectory: process.cwd(),
+			allowedTools: ["Read(**)", "LSP"],
+			mcpConfig: {
+				linear: {
+					type: "http",
+					url: "https://mcp.linear.app/mcp",
+				},
+				github: {
+					type: "http",
+					url: "https://example.com/github/mcp",
+				},
+			},
+		});
+
+		expect(mcpServers).toBeUndefined();
+	});
+
+	it("omits configured servers absent from an explicit MCP allow-list", () => {
+		const mcpServers = buildCodexMcpServersConfig({
+			workingDirectory: process.cwd(),
+			allowedTools: ["mcp__linear__list_issues"],
+			mcpConfig: {
+				linear: {
+					type: "http",
+					url: "https://mcp.linear.app/mcp",
+				},
+				github: {
+					type: "http",
+					url: "https://example.com/github/mcp",
+				},
+			},
+		});
+
+		expect(mcpServers).toEqual({
+			linear: {
+				url: "https://mcp.linear.app/mcp",
+				enabled_tools: ["list_issues"],
+				default_tools_approval_mode: "approve",
+			},
+		});
+	});
+
 	it("leaves Codex MCP servers unrestricted for server-wide Cyrus MCP allowedTools", () => {
 		const mcpServers = buildCodexMcpServersConfig({
 			workingDirectory: process.cwd(),

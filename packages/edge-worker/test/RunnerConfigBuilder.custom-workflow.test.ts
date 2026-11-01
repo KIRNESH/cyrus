@@ -6,6 +6,7 @@ import {
 	type IRunnerSelector,
 	RunnerConfigBuilder,
 	WORKFLOW_MUTATION_TOOLS,
+	WORKFLOW_PLANNING_TOOLS,
 	WORKFLOW_READ_ONLY_TOOLS,
 } from "../src/RunnerConfigBuilder.js";
 
@@ -85,7 +86,7 @@ describe("RunnerConfigBuilder custom workflow permissions", () => {
 		const config = build("claude", "planning", true, [
 			"/home/operator/.supabase",
 		]);
-		expect(config.allowedTools).toEqual([...WORKFLOW_READ_ONLY_TOOLS]);
+		expect(config.allowedTools).toEqual([...WORKFLOW_PLANNING_TOOLS]);
 		for (const mutation of WORKFLOW_MUTATION_TOOLS) {
 			expect(config.disallowedTools).toContain(mutation);
 		}
@@ -97,7 +98,7 @@ describe("RunnerConfigBuilder custom workflow permissions", () => {
 
 	it("forces a Codex read-only permission profile even when the global sandbox is off", () => {
 		const config = build("codex", "planning", false);
-		expect(config.allowedTools).toEqual([...WORKFLOW_READ_ONLY_TOOLS]);
+		expect(config.allowedTools).toEqual([...WORKFLOW_PLANNING_TOOLS]);
 		expect(config.sandbox).toBe("read-only");
 		expect(config.sandboxSettings).toEqual({
 			allowWrite: [],
@@ -106,6 +107,8 @@ describe("RunnerConfigBuilder custom workflow permissions", () => {
 		expect(config.configOverrides).toEqual({
 			sandbox_workspace_write: { network_access: false },
 		});
+		expect(config.webSearchMode).toBe("disabled");
+		expect(config.writableRoots).toBeUndefined();
 	});
 
 	it("exposes only the result callback MCP tool during Manual verification", () => {

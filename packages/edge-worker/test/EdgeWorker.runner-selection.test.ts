@@ -66,6 +66,18 @@ describe("EdgeWorker - Runner Selection Based on Labels", () => {
 		expect(capturedRunnerConfig.sandbox).toBe(mode ?? "workspace-write");
 	});
 
+	it("preserves a workflow's narrower Codex sandbox mode", () => {
+		const worker = new EdgeWorker({
+			...mockConfig,
+			codexSandboxMode: "danger-full-access",
+		});
+		(worker as any).buildRunnerForType("codex", {
+			workingDirectory: "/test/repo",
+			sandbox: "read-only",
+		});
+		expect(capturedRunnerConfig.sandbox).toBe("read-only");
+	});
+
 	let edgeWorker: EdgeWorker;
 	let mockConfig: EdgeWorkerConfig;
 	let mockLinearClient: any;

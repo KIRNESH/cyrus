@@ -50,13 +50,30 @@ describe("resolveCodexSandbox", () => {
 		});
 	});
 
-	it.each([
-		"read-only",
-		"danger-full-access",
-	] as const)("uses native %s mode even with filesystem restrictions", (mode) => {
+	it("uses native read-only with configured runtime workspace roots", () => {
 		expect(
 			resolveCodexSandbox({
-				mode,
+				mode: "read-only",
+				workingDirectory: "/repo/a",
+				writableRoots: ["/repo/out"],
+				networkAccess: false,
+				sandboxSettings: {
+					allowRead: ["/repo/a", "/repo/reference"],
+					allowWrite: ["/repo/out"],
+				},
+			}),
+		).toEqual({
+			kind: "workspace-mode",
+			mode: "read-only",
+			networkAccess: false,
+			writableRoots: ["/repo/a", "/repo/out", "/repo/reference"],
+		});
+	});
+
+	it("uses native danger-full-access even with filesystem restrictions", () => {
+		expect(
+			resolveCodexSandbox({
+				mode: "danger-full-access",
 				workingDirectory: "/repo/a",
 				writableRoots: ["/repo/out"],
 				networkAccess: true,
@@ -64,7 +81,7 @@ describe("resolveCodexSandbox", () => {
 			}),
 		).toEqual({
 			kind: "workspace-mode",
-			mode,
+			mode: "danger-full-access",
 			writableRoots: ["/repo/a", "/repo/out"],
 			networkAccess: true,
 		});

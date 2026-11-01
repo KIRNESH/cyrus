@@ -129,6 +129,7 @@ export type {
 	PersistentCustomWorkflowState,
 	PlanApprovalRecord,
 	PlannedChildSpec,
+	PlanningFailureRecord,
 	PullRequestApprovalRecord,
 	PullRequestCheckResult,
 } from "./custom-workflow.js";

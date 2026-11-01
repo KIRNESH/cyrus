@@ -45,26 +45,42 @@ function uniqueAbsolute(paths: string[]): string[] {
 /**
  * Resolve the per-thread sandbox decision.
  *
- * - Explicit read-only/full-access modes or no `sandboxSettings` use the
- *   corresponding native Codex mode.
- * - Workspace-write with `sandboxSettings` uses a granular `profile` that restricts
- *   reads to an allow-list (worktree + platform defaults + explicit reads) and
- *   writes to the worktree + explicit writable roots.
+ * - Full-access mode, read-only mode, or no `sandboxSettings` uses the
+ *   corresponding native Codex mode. Read-only carries configured read roots
+ *   as runtime workspace roots; the app-server applies its built-in read-only
+ *   policy to every root without selecting a managed permission profile.
+ * - Workspace-write with `sandboxSettings` uses a granular `profile` that
+ *   restricts reads to an allow-list and writes to configured roots.
  */
 export function resolveCodexSandbox(
 	input: SandboxResolveInput,
 ): ResolvedCodexSandbox {
 	const { mode, workingDirectory, writableRoots, networkAccess } = input;
 
-	// Explicit native modes take precedence over generated filesystem profiles.
-	// A root-writable profile still applies OS sandbox restrictions on macOS.
-	if (!input.sandboxSettings || mode !== "workspace-write") {
+	// Full access and read-only remain native. ChatGPT workspace requirements can
+	// reject caller-defined permission profile ids before a turn starts, while
+	// native read-only is an accepted built-in. The app-server's
+	// runtimeWorkspaceRoots field makes the configured roots available without
+	// weakening the native write denial.
+	if (
+		!input.sandboxSettings ||
+		mode === "danger-full-access" ||
+		mode === "read-only"
+	) {
+		const readOnlyRoots =
+			mode === "read-only"
+				? [
+						...writableRoots,
+						...(input.sandboxSettings?.allowRead ?? []),
+						...(input.sandboxSettings?.allowWrite ?? []),
+					]
+				: writableRoots;
 		return {
 			kind: "workspace-mode",
 			mode,
 			writableRoots: uniqueAbsolute([
 				...(workingDirectory ? [workingDirectory] : []),
-				...writableRoots,
+				...readOnlyRoots,
 			]),
 			networkAccess,
 		};

@@ -148,6 +148,57 @@ describe("AppServerCodexBackend", () => {
 		});
 	});
 
+	it("forwards disabled web search in thread config", async () => {
+		const { backend, client } = makeBackend();
+		await backend.open({
+			...baseConfig,
+			codexPath: "/bin/true",
+			webSearchMode: "disabled",
+		});
+		const params = client.lastRequest("thread/start")?.params as {
+			config?: { web_search?: string };
+		};
+		expect(params.config?.web_search).toBe("disabled");
+	});
+
+	it("sends native read-only roots as runtime workspace roots", async () => {
+		const { backend, client } = makeBackend();
+		await backend.open({
+			...baseConfig,
+			codexPath: "/bin/true",
+			sandbox: {
+				kind: "workspace-mode",
+				mode: "read-only",
+				writableRoots: ["/tmp/repo", "/repo/reference"],
+				networkAccess: false,
+			},
+		});
+		const params = client.lastRequest("thread/start")?.params as {
+			sandbox?: string;
+			runtimeWorkspaceRoots?: string[];
+		};
+		expect(params.sandbox).toBe("read-only");
+		expect(params.runtimeWorkspaceRoots).toEqual(["/repo/reference"]);
+	});
+
+	it("does not duplicate cwd as a runtime workspace root", async () => {
+		const { backend, client } = makeBackend();
+		await backend.open({
+			...baseConfig,
+			codexPath: "/bin/true",
+			sandbox: {
+				kind: "workspace-mode",
+				mode: "read-only",
+				writableRoots: ["/tmp/repo"],
+				networkAccess: false,
+			},
+		});
+		const params = client.lastRequest("thread/start")?.params as {
+			runtimeWorkspaceRoots?: string[];
+		};
+		expect(params.runtimeWorkspaceRoots).toBeUndefined();
+	});
+
 	it.each([
 		"read-only",
 		"danger-full-access",

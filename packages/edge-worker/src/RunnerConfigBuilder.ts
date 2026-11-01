@@ -207,6 +207,9 @@ export const WORKFLOW_READ_ONLY_TOOLS = [
 	"ToolSearch",
 ] as const;
 
+/** Planning is local-only; Manual verification may still need read-only web I/O. */
+export const WORKFLOW_PLANNING_TOOLS = ["Read(**)", "LSP"] as const;
+
 export const WORKFLOW_MUTATION_TOOLS = [
 	"Edit(**)",
 	"Write(**)",
@@ -392,12 +395,12 @@ export class RunnerConfigBuilder {
 			input.workflowMode === "planning" ||
 			input.workflowMode === "manual_verification";
 		const workflowAllowedTools = readOnlyWorkflow
-			? [
-					...WORKFLOW_READ_ONLY_TOOLS,
-					...(input.workflowMode === "manual_verification"
-						? ["mcp__cyrus-tools__linear_manual_verification_result"]
-						: []),
-				]
+			? input.workflowMode === "planning"
+				? [...WORKFLOW_PLANNING_TOOLS]
+				: [
+						...WORKFLOW_READ_ONLY_TOOLS,
+						"mcp__cyrus-tools__linear_manual_verification_result",
+					]
 			: input.allowedTools;
 		const workflowDisallowedTools = readOnlyWorkflow
 			? [
@@ -613,8 +616,10 @@ export class RunnerConfigBuilder {
 		}
 		if (runnerType === "codex" && readOnlyWorkflow) {
 			// Codex native shell/file tools are governed by its filesystem sandbox,
-			// not Claude-style allowedTools. Force a read-only thread even when the
-			// global egress sandbox is disabled.
+			// not Claude-style allowedTools. Force a native read-only thread even when
+			// the global egress sandbox is disabled. The runner sends allowRead as
+			// runtime workspace roots rather than selecting a custom permission profile,
+			// which some ChatGPT workspace requirements reject before model execution.
 			config.sandbox = "read-only";
 			config.sandboxSettings = {
 				allowWrite: [],
@@ -627,13 +632,18 @@ export class RunnerConfigBuilder {
 				config.configOverrides = {
 					sandbox_workspace_write: { network_access: false },
 				};
+				config.webSearchMode = "disabled";
 			}
 		}
 
 		// Operator-whitelisted extra writable paths (e.g. `~/.supabase`). Codex
 		// adds these as writable roots in both its default workspace-write mode
 		// and the egress-sandbox profile, so containment is otherwise unchanged.
-		if (runnerType === "codex" && input.sandboxWritablePaths?.length) {
+		if (
+			runnerType === "codex" &&
+			!readOnlyWorkflow &&
+			input.sandboxWritablePaths?.length
+		) {
 			config.writableRoots = input.sandboxWritablePaths;
 		}
 

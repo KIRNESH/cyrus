@@ -19,7 +19,7 @@ import {
 	normalizeMcpHttpTransport,
 } from "cyrus-claude-runner";
 import { getCyrusAppUrl } from "cyrus-cloudflare-tunnel-client";
-import { CodexRunner } from "cyrus-codex-runner";
+import { CodexRunner, type CodexRunnerConfig } from "cyrus-codex-runner";
 import {
 	ConfigUpdater,
 	ensureGhTokenResolver,
@@ -5204,8 +5204,32 @@ ${taskSection}`;
 			await this.startNextChildAndFinalizeParent(parentWorkflow?.issueId);
 			return true;
 		}
-		await this.startCustomPlanningRunner(workflow, fullIssue, labels);
+		await this.runCustomPlanning(workflow, fullIssue, labels);
 		return true;
+	}
+
+	private async runCustomPlanning(
+		workflow: PersistentCustomWorkflow,
+		fullIssue?: Issue,
+		labels?: string[],
+		revisionFeedback?: string,
+	): Promise<void> {
+		try {
+			await this.startCustomPlanningRunner(
+				workflow,
+				fullIssue,
+				labels,
+				revisionFeedback,
+			);
+		} catch (error) {
+			if (workflow.phase !== "planning") throw error;
+			await this.parkCustomPlanningFailure(
+				workflow,
+				redactSensitiveText(
+					error instanceof Error ? error.message : String(error),
+				),
+			);
+		}
 	}
 
 	private async startCustomPlanningRunner(
@@ -5241,7 +5265,7 @@ ${taskSection}`;
 			session.codexSessionId ??
 			session.cursorSessionId ??
 			session.opencodeSessionId;
-		const systemPrompt = `You are Cyrus's read-only planning stage. Inspect the repository and produce a concrete implementation plan, but do not mutate files or repository state, execute shell commands, create branches, commit, push, or open pull requests. Your final answer must be the complete plan and no implementation work.${
+		const systemPrompt = `You are Cyrus's read-only planning stage. Inspect the actual configured local repository and produce a concrete implementation plan. Use the read-only file tools available to your runner; when a shell is available, you may run local inspection commands such as rg, cat, and git status/diff/log. Do not mutate files or repository state, run commands with side effects, use remote connectors or network access, create branches, commit, push, or open pull requests. The local checkout is the source of truth. Your final answer must be the complete source-grounded plan and no implementation work.${
 			workflow.kind === "parent"
 				? `\nFor an approved product/PRD plan, end with exactly one machine-readable block:\n<implementation_children>{"children":[{"key":"stable-key","title":"Independently reviewable feature","description":"Complete implementation scope","dependencies":["other-key"]}]}</implementation_children>\nUse an empty children array only when no implementation child is required.`
 				: ""
@@ -6705,6 +6729,7 @@ ${taskSection}`;
 
 		const guardedPhases = new Set([
 			"planning",
+			"planning_error",
 			"awaiting_plan_approval",
 			"orchestrating",
 			"approved_waiting",
@@ -6713,6 +6738,10 @@ ${taskSection}`;
 			"manual_verified",
 			"awaiting_merge_approval",
 			"merging",
+			"done",
+			"rejected",
+			"canceled",
+			"failed",
 		]);
 		if (!guardedPhases.has(workflow.phase)) return false;
 
@@ -6750,6 +6779,49 @@ ${taskSection}`;
 			rawActivity?.id ??
 			`prompt:${workflow.sessionId}:${String(webhook.createdAt)}:${body}`;
 
+		if (workflow.phase === "planning_error") {
+			const decision = this.customWorkflow.handlePlanningRetryDecision({
+				issueId,
+				sessionId: webhook.agentSession.id,
+				body,
+				userId: actorId ?? "missing-user",
+				authorized,
+				deliveryId,
+			});
+			if (!decision.accepted) {
+				await this.agentSessionManager.createThoughtActivity(
+					workflow.sessionId,
+					authorized
+						? `No workflow action was taken (${decision.reason ?? "an explicit correlated retry decision is required"}). Planning remains parked.`
+						: "No workflow action was taken because the responding identity is not authorized.",
+				);
+				return true;
+			}
+			await this.savePersistedState(true);
+			if (decision.effect === "retry_planning") {
+				this.agentSessionManager.resetRunnerContinuation(workflow.sessionId);
+				await this.savePersistedState(true);
+				await this.agentSessionManager.createThoughtActivity(
+					workflow.sessionId,
+					"Retrying read-only planning in a fresh runner session with the current configuration.",
+				);
+				await this.runCustomPlanning(workflow);
+			} else {
+				await this.agentSessionManager.createResponseActivity(
+					workflow.sessionId,
+					"Planning canceled after the recoverable error; no implementation was started.",
+				);
+				await this.moveIssueToCanceledState(
+					workflow.issueId,
+					workflow.linearWorkspaceId,
+				);
+				await this.startNextChildAndFinalizeParent(
+					workflow.parentWorkflowIssueId,
+				);
+			}
+			return true;
+		}
+
 		if (workflow.phase === "awaiting_plan_approval") {
 			const decision = this.customWorkflow.handlePlanDecision({
 				issueId,
@@ -6770,7 +6842,7 @@ ${taskSection}`;
 			}
 			await this.savePersistedState(true);
 			if (decision.decision === "revise") {
-				await this.startCustomPlanningRunner(
+				await this.runCustomPlanning(
 					workflow,
 					undefined,
 					undefined,
@@ -6910,21 +6982,9 @@ ${taskSection}`;
 
 		if (workflow.phase === "planning") {
 			if (resultMessage.subtype !== "success" || !result) {
-				this.customWorkflow.markFailed(
-					workflow.issueId,
-					"Read-only planning did not produce a usable plan",
-				);
-				await this.savePersistedState(true);
-				await this.agentSessionManager.createErrorActivity(
-					sessionId,
-					"Read-only planning ended without a usable plan; no implementation was started.",
-				);
-				await this.moveIssueToCanceledState(
-					workflow.issueId,
-					workflow.linearWorkspaceId,
-				);
-				await this.startNextChildAndFinalizeParent(
-					workflow.parentWorkflowIssueId,
+				await this.parkCustomPlanningFailure(
+					workflow,
+					this.planningFailureMessage(resultMessage),
 				);
 				return { suppressParentResume: true };
 			}
@@ -6939,8 +6999,8 @@ ${taskSection}`;
 					await this.postPlanApprovalInteraction(completion.workflow);
 				}
 			} catch (error) {
-				await this.agentSessionManager.createErrorActivity(
-					sessionId,
+				await this.parkCustomPlanningFailure(
+					workflow,
 					`The planner response could not be turned into an approval request: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`,
 				);
 			}
@@ -7005,6 +7065,40 @@ ${taskSection}`;
 		return { suppressParentResume: true };
 	}
 
+	private planningFailureMessage(resultMessage: SDKResultMessage): string {
+		const result =
+			"result" in resultMessage && typeof resultMessage.result === "string"
+				? resultMessage.result.trim()
+				: "";
+		const errors =
+			"errors" in resultMessage && Array.isArray(resultMessage.errors)
+				? resultMessage.errors
+						.filter((error): error is string => typeof error === "string")
+						.join("; ")
+				: "";
+		return redactSensitiveText(
+			errors ||
+				result ||
+				(resultMessage.subtype === "success"
+					? "Read-only planning completed without producing a plan"
+					: `Read-only planning failed (${resultMessage.subtype})`),
+		);
+	}
+
+	private async parkCustomPlanningFailure(
+		workflow: PersistentCustomWorkflow,
+		message: string,
+	): Promise<void> {
+		if (workflow.phase !== "planning") return;
+		this.customWorkflow.markPlanningError(workflow.issueId, message);
+		await this.savePersistedState(true);
+		await this.agentSessionManager.createErrorActivity(
+			workflow.sessionId,
+			`Read-only planning failed before producing an approval-ready plan: ${message}. The issue remains open and no implementation was started.`,
+		);
+		await this.postPlanningRetryInteraction(workflow);
+	}
+
 	private manualVerificationSummary(
 		workflow: PersistentCustomWorkflow,
 	): string {
@@ -7029,10 +7123,27 @@ ${taskSection}`;
 		);
 	}
 
+	private async postPlanningRetryInteraction(
+		workflow: PersistentCustomWorkflow,
+	): Promise<void> {
+		const failure = workflow.planningFailure;
+		if (!failure || failure.status !== "pending") return;
+		await this.agentSessionManager.createSelectElicitation(
+			workflow.sessionId,
+			`Planning attempt ${failure.attempt} failed. The issue remains open and implementation is still blocked. Retry starts a fresh runner session using the current Cyrus configuration; Cancel ends this workflow.`,
+			this.customWorkflow.planningRetryOptions(workflow),
+		);
+	}
+
 	private async recoverCustomWorkflowInteractions(): Promise<void> {
 		for (const workflow of this.customWorkflow.list()) {
 			if (workflow.phase === "planning") {
-				await this.startCustomPlanningRunner(workflow);
+				await this.runCustomPlanning(workflow);
+			} else if (
+				workflow.phase === "planning_error" &&
+				workflow.planningFailure?.status === "pending"
+			) {
+				await this.postPlanningRetryInteraction(workflow);
 			} else if (
 				workflow.phase === "awaiting_plan_approval" &&
 				workflow.planApproval?.status === "pending"
@@ -7203,11 +7314,19 @@ ${taskSection}`;
 			}
 			case "gemini":
 				return new GeminiRunner(config);
-			case "codex":
+			case "codex": {
+				const codexConfig = config as CodexRunnerConfig;
 				return new CodexRunner({
-					...config,
-					sandbox: this.config.codexSandboxMode ?? "workspace-write",
+					...codexConfig,
+					// Workflow stages can narrow the operator default (planning and
+					// manual verification are read-only). Do not widen that per-session
+					// boundary again at the shared runner factory.
+					sandbox:
+						codexConfig.sandbox ??
+						this.config.codexSandboxMode ??
+						"workspace-write",
 				});
+			}
 			case "cursor":
 				return new CursorRunner(config);
 			case "opencode":

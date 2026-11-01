@@ -1390,6 +1390,28 @@ export class AgentSessionManager extends EventEmitter {
 	}
 
 	/**
+	 * Prepare a parked workflow for a genuinely fresh runner attempt.
+	 *
+	 * Planner infrastructure failures must not resume the provider thread that
+	 * failed during request preparation. Clearing every provider continuation id
+	 * also lets current label/config selection choose the runner again on retry.
+	 */
+	resetRunnerContinuation(sessionId: string): CyrusAgentSession {
+		const session = this.sessions.get(sessionId);
+		if (!session) throw new Error(`No session found for ${sessionId}`);
+		session.agentRunner?.stop();
+		session.agentRunner = undefined;
+		session.claudeSessionId = undefined;
+		session.geminiSessionId = undefined;
+		session.codexSessionId = undefined;
+		session.cursorSessionId = undefined;
+		session.opencodeSessionId = undefined;
+		session.status = AgentSessionStatus.Active;
+		session.updatedAt = Date.now();
+		return session;
+	}
+
+	/**
 	 * Get session entries by session ID
 	 */
 	getSessionEntries(sessionId: string): CyrusAgentSessionEntry[] {

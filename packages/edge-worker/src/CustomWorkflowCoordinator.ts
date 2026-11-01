@@ -14,6 +14,7 @@ import {
 
 const DECISION_PATTERN =
 	/^\[(Approve|Revise|Reject|Cancel)\|([^\]]+)](?:\s*[:-]\s*([\s\S]+))?$/i;
+const PLANNING_RETRY_PATTERN = /^\[(Retry|Cancel)\|([^\]]+)]$/i;
 
 const ACTIVE_CHILD_PHASES = new Set<CustomWorkflowPhase>([
 	"implementing",
@@ -54,6 +55,13 @@ export interface PlanDecisionResult {
 		| "wait_for_slot_or_dependencies"
 		| "finish_parent"
 		| "terminal";
+}
+
+export interface PlanningRetryDecisionResult {
+	accepted: boolean;
+	reason?: string;
+	decision?: "retry" | "cancel";
+	effect?: "retry_planning" | "terminal";
 }
 
 export interface MergeDecisionResult {
@@ -127,15 +135,7 @@ export class CustomWorkflowCoordinator {
 
 	constructor(state?: PersistentCustomWorkflowState) {
 		this.state = state ?? createEmptyCustomWorkflowState();
-		if (this.state.version !== 1) {
-			throw new Error(
-				`Unsupported custom workflow state version ${String(this.state.version)}`,
-			);
-		}
-		for (const workflow of Object.values(this.state.workflows)) {
-			workflow.dependencyRelations ??= [];
-			workflow.decompositionComplete ??= false;
-		}
+		this.normalizeState();
 	}
 
 	serialize(): PersistentCustomWorkflowState {
@@ -144,6 +144,10 @@ export class CustomWorkflowCoordinator {
 
 	restore(state?: PersistentCustomWorkflowState): void {
 		this.state = state ?? createEmptyCustomWorkflowState();
+		this.normalizeState();
+	}
+
+	private normalizeState(): void {
 		if (this.state.version !== 1) {
 			throw new Error(
 				`Unsupported custom workflow state version ${String(this.state.version)}`,
@@ -152,6 +156,30 @@ export class CustomWorkflowCoordinator {
 		for (const workflow of Object.values(this.state.workflows)) {
 			workflow.dependencyRelations ??= [];
 			workflow.decompositionComplete ??= false;
+			// v1 initially treated planner infrastructure errors as terminal failures.
+			// Recover only unmistakable pre-plan failures; implementation failures stay
+			// terminal and cannot be restarted through the planning gate.
+			if (
+				workflow.phase === "failed" &&
+				workflow.planRevision === 0 &&
+				!workflow.plan &&
+				!workflow.planApproval
+			) {
+				const message =
+					workflow.failureReason ??
+					"A previous planning attempt failed before producing a plan";
+				workflow.phase = "planning_error";
+				workflow.planningFailure ??= {
+					correlationId: `planning-retry-legacy-${digest(workflow.issueId).slice(0, 20)}`,
+					message,
+					status: "pending",
+					attempt: 1,
+					createdAt: workflow.updatedAt,
+				};
+			}
+		}
+		for (const workflow of Object.values(this.state.workflows)) {
+			this.syncParentChild(workflow, workflow.planningFailure?.message);
 		}
 	}
 
@@ -233,6 +261,8 @@ export class CustomWorkflowCoordinator {
 
 		workflow.plan = normalizedPlan;
 		workflow.planRevision = revision;
+		workflow.planningFailure = undefined;
+		workflow.failureReason = undefined;
 		workflow.plannedChildren = plannedChildren;
 		workflow.planApproval = {
 			correlationId,
@@ -250,6 +280,82 @@ export class CustomWorkflowCoordinator {
 			duplicate: false,
 			workflow,
 			options: this.planDecisionOptions(workflow),
+		};
+	}
+
+	markPlanningError(
+		issueId: string,
+		message: string,
+	): PersistentCustomWorkflow {
+		const workflow = this.require(issueId);
+		if (workflow.phase !== "planning" && workflow.phase !== "planning_error") {
+			throw new Error(
+				`Cannot record a planning error for ${issueId} from ${workflow.phase}`,
+			);
+		}
+		const attempt = (workflow.planningFailure?.attempt ?? 0) + 1;
+		workflow.phase = "planning_error";
+		workflow.failureReason = message;
+		workflow.planningFailure = {
+			correlationId: `planning-retry-${attempt}-${randomUUID()}`,
+			message,
+			status: "pending",
+			attempt,
+			createdAt: Date.now(),
+		};
+		workflow.updatedAt = Date.now();
+		this.syncParentChild(workflow, message);
+		return workflow;
+	}
+
+	handlePlanningRetryDecision(input: {
+		issueId: string;
+		sessionId: string;
+		body: string;
+		userId: string;
+		authorized: boolean;
+		deliveryId: string;
+	}): PlanningRetryDecisionResult {
+		const workflow = this.require(input.issueId);
+		if (workflow.sessionId !== input.sessionId) {
+			return { accepted: false, reason: "Retry session does not match" };
+		}
+		if (!input.authorized) {
+			return { accepted: false, reason: "User is not authorized" };
+		}
+		if (this.isDuplicate(input.deliveryId)) {
+			return { accepted: false, reason: "Duplicate delivery" };
+		}
+		if (
+			workflow.phase !== "planning_error" ||
+			workflow.planningFailure?.status !== "pending"
+		) {
+			return { accepted: false, reason: "No planning retry is pending" };
+		}
+		const parsed = PLANNING_RETRY_PATTERN.exec(input.body.trim());
+		if (!parsed) {
+			return { accepted: false, reason: "Prompt is not a retry decision" };
+		}
+		if (parsed[2] !== workflow.planningFailure.correlationId) {
+			return { accepted: false, reason: "Planning retry is stale" };
+		}
+
+		const decision = parsed[1]!.toLowerCase() as "retry" | "cancel";
+		workflow.planningFailure.status =
+			decision === "retry" ? "retried" : "canceled";
+		workflow.planningFailure.decidedAt = Date.now();
+		workflow.planningFailure.decidedByUserId = input.userId;
+		workflow.phase = decision === "retry" ? "planning" : "canceled";
+		workflow.updatedAt = Date.now();
+		this.markProcessed(input.deliveryId);
+		this.syncParentChild(
+			workflow,
+			decision === "cancel" ? "Planning canceled after an error" : undefined,
+		);
+		return {
+			accepted: true,
+			decision,
+			effect: decision === "retry" ? "retry_planning" : "terminal",
 		};
 	}
 
@@ -625,6 +731,7 @@ export class CustomWorkflowCoordinator {
 	markFailed(issueId: string, reason: string): string | undefined {
 		const workflow = this.require(issueId);
 		workflow.phase = "failed";
+		workflow.failureReason = reason;
 		workflow.updatedAt = Date.now();
 		this.syncParentChild(workflow, reason);
 		return this.activateNextChild(workflow.parentWorkflowIssueId);
@@ -834,6 +941,12 @@ export class CustomWorkflowCoordinator {
 		];
 	}
 
+	planningRetryOptions(workflow: PersistentCustomWorkflow): string[] {
+		const correlationId = workflow.planningFailure?.correlationId;
+		if (!correlationId) return [];
+		return [`[Retry|${correlationId}]`, `[Cancel|${correlationId}]`];
+	}
+
 	mergeDecisionOptions(workflow: PersistentCustomWorkflow): string[] {
 		const correlationId = workflow.mergeApproval?.correlationId;
 		if (!correlationId) return [];
@@ -938,6 +1051,7 @@ function childStatusForPhase(
 	phase: CustomWorkflowPhase,
 ): PersistentChildResult["status"] {
 	if (phase === "planning") return "planning";
+	if (phase === "planning_error") return "planning_error";
 	if (phase === "awaiting_plan_approval") return "awaiting_plan_approval";
 	if (phase === "approved_waiting") return "approved_waiting";
 	if (
@@ -984,19 +1098,25 @@ function parseDecision(body: string): {
 }
 
 /**
- * Parse the machine-readable decomposition emitted by the parent planner.
- * A plan with no decomposition block intentionally represents zero children.
+ * Parse the single machine-readable decomposition emitted by the parent planner.
+ * Zero children are represented explicitly by a block with an empty array so a
+ * truncated planner response can never be mistaken for an approved no-op.
  */
 export function parsePlannedChildren(plan: string): PlannedChildSpec[] {
-	const tagged =
-		/<implementation_children>\s*([\s\S]*?)\s*<\/implementation_children>/i.exec(
-			plan,
+	const tagged = [
+		...plan.matchAll(
+			/<implementation_children>\s*([\s\S]*?)\s*<\/implementation_children>/gi,
+		),
+	];
+	if (tagged.length !== 1) {
+		throw new Error(
+			`Parent plan must contain exactly one implementation_children block (found ${tagged.length})`,
 		);
-	if (!tagged) return [];
+	}
 
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(tagged[1]!);
+		parsed = JSON.parse(tagged[0]![1]!);
 	} catch (error) {
 		throw new Error(
 			`Invalid implementation_children JSON: ${error instanceof Error ? error.message : String(error)}`,

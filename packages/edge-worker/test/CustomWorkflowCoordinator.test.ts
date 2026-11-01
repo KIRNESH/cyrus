@@ -58,6 +58,24 @@ function decidePlan(
 	});
 }
 
+function decidePlanningRetry(
+	coordinator: CustomWorkflowCoordinator,
+	issueId: string,
+	decision: "Retry" | "Cancel",
+	deliveryId: string,
+	authorized = true,
+) {
+	const workflow = coordinator.get(issueId)!;
+	return coordinator.handlePlanningRetryDecision({
+		issueId,
+		sessionId: workflow.sessionId,
+		body: `[${decision}|${workflow.planningFailure!.correlationId}]`,
+		userId: authorized ? "user-1" : "intruder",
+		authorized,
+		deliveryId,
+	});
+}
+
 function requestMerge(
 	coordinator: CustomWorkflowCoordinator,
 	issueId: string,
@@ -233,9 +251,107 @@ describe("CustomWorkflowCoordinator plan gate", () => {
 	});
 });
 
+describe("CustomWorkflowCoordinator recoverable planning failures", () => {
+	it("persists the actual error and retries in a fresh planning phase only after authorization", () => {
+		const before = new CustomWorkflowCoordinator();
+		start(before, "feature");
+		before.markPlanningError(
+			"feature",
+			"failed to load workspace requirements",
+		);
+		expect(before.get("feature")).toMatchObject({
+			phase: "planning_error",
+			failureReason: "failed to load workspace requirements",
+			planningFailure: {
+				message: "failed to load workspace requirements",
+				status: "pending",
+				attempt: 1,
+			},
+		});
+		expect(before.planningRetryOptions(before.get("feature")!)).toHaveLength(2);
+
+		const after = new CustomWorkflowCoordinator(before.serialize());
+		expect(
+			decidePlanningRetry(
+				after,
+				"feature",
+				"Retry",
+				"unauthorized-retry",
+				false,
+			),
+		).toMatchObject({ accepted: false, reason: "User is not authorized" });
+		expect(after.get("feature")!.phase).toBe("planning_error");
+
+		const retry = decidePlanningRetry(after, "feature", "Retry", "retry-once");
+		expect(retry).toMatchObject({
+			accepted: true,
+			decision: "retry",
+			effect: "retry_planning",
+		});
+		expect(after.get("feature")!.phase).toBe("planning");
+		expect(
+			decidePlanningRetry(after, "feature", "Retry", "retry-once"),
+		).toMatchObject({ accepted: false });
+
+		plan(after, "feature", "Source-grounded replacement plan");
+		expect(after.get("feature")!.phase).toBe("awaiting_plan_approval");
+		expect(after.get("feature")!.planningFailure).toBeUndefined();
+	});
+
+	it("cancels only after an explicit correlated decision", () => {
+		const coordinator = new CustomWorkflowCoordinator();
+		start(coordinator, "cancel-planning");
+		coordinator.markPlanningError("cancel-planning", "startup failed");
+		expect(
+			coordinator.handlePlanningRetryDecision({
+				issueId: "cancel-planning",
+				sessionId: "session-cancel-planning",
+				body: "cancel",
+				userId: "user-1",
+				authorized: true,
+				deliveryId: "plain-cancel",
+			}),
+		).toMatchObject({
+			accepted: false,
+			reason: "Prompt is not a retry decision",
+		});
+		expect(
+			decidePlanningRetry(
+				coordinator,
+				"cancel-planning",
+				"Cancel",
+				"correlated-cancel",
+			),
+		).toMatchObject({ accepted: true, effect: "terminal" });
+		expect(coordinator.get("cancel-planning")!.phase).toBe("canceled");
+	});
+
+	it("recovers legacy pre-plan terminal failures as retryable", () => {
+		const legacy = new CustomWorkflowCoordinator();
+		start(legacy, "legacy");
+		legacy.markFailed("legacy", "old planning failure");
+
+		const restored = new CustomWorkflowCoordinator(legacy.serialize());
+		expect(restored.get("legacy")).toMatchObject({
+			phase: "planning_error",
+			planningFailure: {
+				message: "old planning failure",
+				status: "pending",
+			},
+		});
+	});
+});
+
 describe("CustomWorkflowCoordinator decomposition and aggregation", () => {
 	it("parses zero, one, and multiple child plans", () => {
-		expect(parsePlannedChildren("No implementation needed")).toEqual([]);
+		expect(() => parsePlannedChildren("No implementation needed")).toThrow(
+			"exactly one implementation_children block",
+		);
+		expect(
+			parsePlannedChildren(
+				'<implementation_children>{"children":[]}</implementation_children>',
+			),
+		).toEqual([]);
 		expect(
 			parsePlannedChildren(
 				'<implementation_children>{"children":[{"key":"alpha","title":"Alpha","description":"Add alpha","dependencies":[]}]}</implementation_children>',
@@ -256,7 +372,11 @@ describe("CustomWorkflowCoordinator decomposition and aggregation", () => {
 	it("finishes a zero-child parent only after explicit approval", () => {
 		const coordinator = new CustomWorkflowCoordinator();
 		start(coordinator, "parent", "parent");
-		plan(coordinator, "parent", "Documentation-only analysis; no code needed.");
+		plan(
+			coordinator,
+			"parent",
+			'Documentation-only analysis; no code needed.\n<implementation_children>{"children":[]}</implementation_children>',
+		);
 		expect(coordinator.get("parent")!.phase).toBe("awaiting_plan_approval");
 		expect(
 			decidePlan(coordinator, "parent", "Approve", "parent-approve").effect,

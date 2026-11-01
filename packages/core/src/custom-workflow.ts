@@ -5,6 +5,7 @@ export type CustomWorkflowKind = "parent" | "feature";
 
 export type CustomWorkflowPhase =
 	| "planning"
+	| "planning_error"
 	| "awaiting_plan_approval"
 	| "orchestrating"
 	| "approved_waiting"
@@ -39,6 +40,7 @@ export interface PersistentChildResult {
 	status:
 		| "pending"
 		| "planning"
+		| "planning_error"
 		| "awaiting_plan_approval"
 		| "approved_waiting"
 		| "implementing"
@@ -59,6 +61,16 @@ export interface PlanApprovalRecord {
 	revision: number;
 	planDigest: string;
 	status: "pending" | "approved" | "revised" | "rejected" | "canceled";
+	createdAt: number;
+	decidedAt?: number;
+	decidedByUserId?: string;
+}
+
+export interface PlanningFailureRecord {
+	correlationId: string;
+	message: string;
+	status: "pending" | "retried" | "canceled";
+	attempt: number;
 	createdAt: number;
 	decidedAt?: number;
 	decidedByUserId?: string;
@@ -130,6 +142,8 @@ export interface PersistentCustomWorkflow {
 	planRevision: number;
 	plan?: string;
 	planApproval?: PlanApprovalRecord;
+	planningFailure?: PlanningFailureRecord;
+	failureReason?: string;
 	plannedChildren: PlannedChildSpec[];
 	children: Record<string, PersistentChildResult>;
 	/** True only after the complete child set and dependency relations are durable. */

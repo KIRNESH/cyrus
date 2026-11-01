@@ -7,6 +7,35 @@ import { CodexConfigBuilder } from "../src/config/CodexConfigBuilder.js";
 const codexHome = mkdtempSync(join(tmpdir(), "codex-home-"));
 
 describe("CodexConfigBuilder writableRoots (operator path whitelist)", () => {
+	it("resolves a local-only planning profile without MCP or writable roots", async () => {
+		const resolved = await new CodexConfigBuilder({
+			workingDirectory: "/ws/repo",
+			codexHome,
+			sandbox: "read-only",
+			sandboxSettings: {
+				allowWrite: [],
+				allowRead: ["/ws/repo", "/ws/reference"],
+			},
+			allowedTools: ["Read(**)", "LSP"],
+			mcpConfig: {
+				github: { type: "http", url: "https://example.com/github/mcp" },
+			},
+			configOverrides: {
+				sandbox_workspace_write: { network_access: false },
+			},
+			webSearchMode: "disabled",
+		}).build();
+
+		expect(resolved.sandbox).toEqual({
+			kind: "workspace-mode",
+			mode: "read-only",
+			networkAccess: false,
+			writableRoots: ["/ws/repo", "/ws/reference"],
+		});
+		expect(resolved.configOverrides).toBeUndefined();
+		expect(resolved.webSearchMode).toBe("disabled");
+	});
+
 	it("adds whitelisted paths as writable roots in workspace-write mode", async () => {
 		const resolved = await new CodexConfigBuilder({
 			workingDirectory: "/ws/repo",

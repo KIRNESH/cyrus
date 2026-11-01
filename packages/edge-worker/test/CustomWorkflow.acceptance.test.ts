@@ -143,6 +143,75 @@ function githubFixture(pullRequests: Map<number, PullRequestFixture>) {
 }
 
 describe("custom workflow acceptance fixture", () => {
+	it("retries a failed child planner without creating a duplicate sub-issue or bypassing approval", () => {
+		const beforeRestart = new CustomWorkflowCoordinator();
+		start(beforeRestart, "parent-retry", "parent");
+		beforeRestart.completePlanning(
+			"parent-retry",
+			'<implementation_children>{"children":[{"key":"feature","title":"Recoverable feature","description":"Implement after planning recovers","dependencies":[]}]}</implementation_children>',
+			"parent-retry-plan",
+		);
+		expect(
+			decidePlan(
+				beforeRestart,
+				"parent-retry",
+				"Approve",
+				"parent-retry-approve",
+			).effect,
+		).toBe("decompose");
+		beforeRestart.registerChildIssue("parent-retry", "feature", {
+			issueId: "feature-retry",
+			issueIdentifier: "FEATURE-RETRY",
+			issueUrl: "https://linear.test/feature-retry",
+		});
+		start(beforeRestart, "feature-retry", "feature", "parent-retry");
+		beforeRestart.bindFeatureToParent("feature-retry");
+		beforeRestart.finishDecomposition("parent-retry");
+		beforeRestart.markPlanningError(
+			"feature-retry",
+			"failed to load workspace requirements",
+		);
+
+		const afterRestart = new CustomWorkflowCoordinator(
+			beforeRestart.serialize(),
+		);
+		const failedChild = afterRestart.get("feature-retry")!;
+		const retry = afterRestart.handlePlanningRetryDecision({
+			issueId: failedChild.issueId,
+			sessionId: failedChild.sessionId,
+			body: `[Retry|${failedChild.planningFailure!.correlationId}]`,
+			userId: "human-1",
+			authorized: true,
+			deliveryId: "feature-retry-once",
+		});
+		expect(retry.effect).toBe("retry_planning");
+		afterRestart.completePlanning(
+			"feature-retry",
+			"Inspect the source and implement the recovered feature.",
+			"feature-retry-plan",
+		);
+		expect(afterRestart.get("feature-retry")!.phase).toBe(
+			"awaiting_plan_approval",
+		);
+		expect(
+			decidePlan(
+				afterRestart,
+				"feature-retry",
+				"Approve",
+				"feature-retry-approve",
+			).effect,
+		).toBe("start_implementation");
+		afterRestart.markImplementationStarted("feature-retry");
+
+		expect(afterRestart.list()).toHaveLength(2);
+		expect(
+			Object.values(afterRestart.get("parent-retry")!.children).map(
+				(child) => child.issueId,
+			),
+		).toEqual(["feature-retry"]);
+		expect(afterRestart.get("feature-retry")!.phase).toBe("implementing");
+	});
+
 	it("runs revised parent planning, three separately approved children, protected merges, dependencies, and final links", async () => {
 		const coordinator = new CustomWorkflowCoordinator();
 		const worktrees = new Set<string>();
