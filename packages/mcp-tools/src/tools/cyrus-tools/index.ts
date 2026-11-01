@@ -107,6 +107,37 @@ export interface CyrusToolsOptions {
 	 */
 	parentSessionId?: string;
 
+	/** Create and persist a human-owned Manual blocker for the current session. */
+	onManualBlockerRequested?: (input: {
+		sessionId: string;
+		key: string;
+		title: string;
+		why: string;
+		options?: string;
+		steps: string;
+		handBack: string;
+		verify: string;
+	}) => Promise<{
+		issueIdentifier: string;
+		issueUrl?: string;
+		created: boolean;
+	}>;
+
+	/** Record the read-only verification result for a completed Manual issue. */
+	onManualVerificationResult?: (input: {
+		sessionId: string;
+		blockerKey: string;
+		success: boolean;
+		result: string;
+	}) => Promise<{ resumeImplementation: boolean }>;
+
+	/** Validate a PR/check snapshot and post a persistent merge interaction. */
+	onMergeApprovalRequested?: (input: {
+		sessionId: string;
+		pullRequestNumber: number;
+		previewUrl?: string;
+	}) => Promise<{ pullRequestUrl: string; headSha: string; created: boolean }>;
+
 	/**
 	 * Optional dependencies for the `log_failure_mode` tool. When omitted,
 	 * the tool is not registered (e.g. in CLI mode without a control plane).
@@ -326,6 +357,135 @@ export function createCyrusToolsServer(
 					},
 				],
 			};
+		},
+	);
+
+	server.registerTool(
+		"linear_create_manual_blocker",
+		{
+			description:
+				"Create a human-owned, non-delegated Manual issue and block the current agent issue. Use only for credentials/accounts, spending/vendor lock-in, DNS/OAuth/billing/identity/provider consoles, host services/packages, production deployment decisions, or actions outside the worktree/agent authority. Never include or request a secret.",
+			inputSchema: {
+				key: z
+					.string()
+					.regex(/^[a-z0-9][a-z0-9_-]{0,63}$/i)
+					.describe("Stable idempotency key for this blocker"),
+				title: z.string().min(1).describe("Concise Manual issue title"),
+				why: z
+					.string()
+					.min(1)
+					.describe("One sentence explaining what is blocked"),
+				options: z
+					.string()
+					.optional()
+					.describe(
+						"Only for a real decision: cost, effort, lock-in, risks, recommendation",
+					),
+				steps: z
+					.string()
+					.min(1)
+					.describe("Exact browser actions or commands for the human"),
+				handBack: z
+					.string()
+					.min(1)
+					.describe(
+						"Where a non-secret result belongs; never request a secret",
+					),
+				verify: z
+					.string()
+					.min(1)
+					.describe("Non-secret verification Cyrus will run after completion"),
+			},
+		},
+		async ({
+			key,
+			title,
+			why,
+			options: decisionOptions,
+			steps,
+			handBack,
+			verify,
+		}) => {
+			if (!options.parentSessionId || !options.onManualBlockerRequested) {
+				return toolError("Manual blocker workflow is unavailable");
+			}
+			try {
+				const result = await options.onManualBlockerRequested({
+					sessionId: options.parentSessionId,
+					key,
+					title,
+					why,
+					...(decisionOptions ? { options: decisionOptions } : {}),
+					steps,
+					handBack,
+					verify,
+				});
+				return toolSuccess(result);
+			} catch {
+				return toolError(
+					"Manual blocker creation was refused. Check that the body contains no secrets or requests to post secrets.",
+				);
+			}
+		},
+	);
+
+	server.registerTool(
+		"linear_manual_verification_result",
+		{
+			description:
+				"Report the non-secret result of the required read-only verification after a Manual issue is completed. Failure keeps the workflow blocked.",
+			inputSchema: {
+				blockerKey: z.string().min(1),
+				success: z.boolean(),
+				result: z.string().min(1).describe("Non-secret verification evidence"),
+			},
+		},
+		async ({ blockerKey, success, result }) => {
+			if (!options.parentSessionId || !options.onManualVerificationResult) {
+				return toolError("Manual verification workflow is unavailable");
+			}
+			try {
+				return toolSuccess(
+					await options.onManualVerificationResult({
+						sessionId: options.parentSessionId,
+						blockerKey,
+						success,
+						result,
+					}),
+				);
+			} catch {
+				return toolError("Manual verification result was refused");
+			}
+		},
+	);
+
+	server.registerTool(
+		"github_request_merge_approval",
+		{
+			description:
+				"Request explicit merge approval for the current issue after its Cyrus-created pull request exists and all required checks pass. Cyrus re-fetches the PR and checks; never call this before CI is green.",
+			inputSchema: {
+				pullRequestNumber: z.number().int().positive(),
+				previewUrl: z.string().url().optional(),
+			},
+		},
+		async ({ pullRequestNumber, previewUrl }) => {
+			if (!options.parentSessionId || !options.onMergeApprovalRequested) {
+				return toolError("Merge approval workflow is unavailable");
+			}
+			try {
+				return toolSuccess(
+					await options.onMergeApprovalRequested({
+						sessionId: options.parentSessionId,
+						pullRequestNumber,
+						...(previewUrl ? { previewUrl } : {}),
+					}),
+				);
+			} catch {
+				return toolError(
+					"Merge approval request was refused. Verify the pull request identity and required checks before retrying.",
+				);
+			}
 		},
 	);
 
@@ -836,4 +996,32 @@ export function createCyrusToolsServer(
 	}
 
 	return server;
+}
+
+function toolSuccess(value: unknown) {
+	return {
+		content: [
+			{
+				type: "text" as const,
+				text: JSON.stringify({ success: true, ...asRecord(value) }),
+			},
+		],
+	};
+}
+
+function toolError(error: string) {
+	return {
+		content: [
+			{
+				type: "text" as const,
+				text: JSON.stringify({ success: false, error }),
+			},
+		],
+	};
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+	return typeof value === "object" && value !== null
+		? Object.fromEntries(Object.entries(value))
+		: { result: value };
 }

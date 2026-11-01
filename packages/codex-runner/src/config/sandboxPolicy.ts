@@ -45,24 +45,42 @@ function uniqueAbsolute(paths: string[]): string[] {
 /**
  * Resolve the per-thread sandbox decision.
  *
- * - No `sandboxSettings` → `workspace-mode` (the coarse Codex mode with broad
- *   reads — unchanged default behavior).
- * - `sandboxSettings` present → a granular permission `profile` that restricts
- *   reads to an allow-list (worktree + platform defaults + explicit reads) and
- *   writes to the worktree + explicit writable roots.
+ * - Full-access mode, read-only mode, or no `sandboxSettings` uses the
+ *   corresponding native Codex mode. Read-only carries configured read roots
+ *   as runtime workspace roots; the app-server applies its built-in read-only
+ *   policy to every root without selecting a managed permission profile.
+ * - Workspace-write with `sandboxSettings` uses a granular `profile` that
+ *   restricts reads to an allow-list and writes to configured roots.
  */
 export function resolveCodexSandbox(
 	input: SandboxResolveInput,
 ): ResolvedCodexSandbox {
 	const { mode, workingDirectory, writableRoots, networkAccess } = input;
 
-	if (!input.sandboxSettings) {
+	// Full access and read-only remain native. ChatGPT workspace requirements can
+	// reject caller-defined permission profile ids before a turn starts, while
+	// native read-only is an accepted built-in. The app-server's
+	// runtimeWorkspaceRoots field makes the configured roots available without
+	// weakening the native write denial.
+	if (
+		!input.sandboxSettings ||
+		mode === "danger-full-access" ||
+		mode === "read-only"
+	) {
+		const readOnlyRoots =
+			mode === "read-only"
+				? [
+						...writableRoots,
+						...(input.sandboxSettings?.allowRead ?? []),
+						...(input.sandboxSettings?.allowWrite ?? []),
+					]
+				: writableRoots;
 		return {
 			kind: "workspace-mode",
 			mode,
 			writableRoots: uniqueAbsolute([
 				...(workingDirectory ? [workingDirectory] : []),
-				...writableRoots,
+				...readOnlyRoots,
 			]),
 			networkAccess,
 		};
@@ -79,22 +97,14 @@ export function resolveCodexSandbox(
 		(p) => p !== cwd && !writableAbs.includes(p),
 	);
 
-	// Danger-full-access keeps broad access; read-only forbids writes; the
-	// default (workspace-write) makes the worktree writable.
-	const dangerFull = mode === "danger-full-access";
-	const workspaceAccess: CodexFileSystemAccess =
-		mode === "read-only" ? "read" : "write";
-
-	const filesystem: Record<string, CodexFileSystemAccess> = dangerFull
-		? { ":root": "write" }
-		: {
-				":minimal": "read",
-				":workspace_roots": workspaceAccess,
-				":tmpdir": "write",
-				":slash_tmp": "write",
-				...Object.fromEntries(writableAbs.map((p) => [p, "write" as const])),
-				...Object.fromEntries(readableAbs.map((p) => [p, "read" as const])),
-			};
+	const filesystem: Record<string, CodexFileSystemAccess> = {
+		":minimal": "read",
+		":workspace_roots": "write",
+		":tmpdir": "write",
+		":slash_tmp": "write",
+		...Object.fromEntries(writableAbs.map((p) => [p, "write" as const])),
+		...Object.fromEntries(readableAbs.map((p) => [p, "read" as const])),
+	};
 
 	return {
 		kind: "profile",

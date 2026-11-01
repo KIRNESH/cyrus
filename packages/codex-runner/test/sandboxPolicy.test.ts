@@ -50,41 +50,40 @@ describe("resolveCodexSandbox", () => {
 		});
 	});
 
-	it("maps read-only mode to a read-only worktree in the profile", () => {
+	it("uses native read-only with configured runtime workspace roots", () => {
 		expect(
 			resolveCodexSandbox({
 				mode: "read-only",
 				workingDirectory: "/repo/a",
-				writableRoots: [],
-				networkAccess: true,
-				sandboxSettings: { allowRead: ["/repo/a"] },
+				writableRoots: ["/repo/out"],
+				networkAccess: false,
+				sandboxSettings: {
+					allowRead: ["/repo/a", "/repo/reference"],
+					allowWrite: ["/repo/out"],
+				},
 			}),
 		).toEqual({
-			kind: "profile",
-			profileId: CYRUS_SANDBOX_PROFILE_ID,
-			networkAccess: true,
-			filesystem: {
-				":minimal": "read",
-				":workspace_roots": "read",
-				":tmpdir": "write",
-				":slash_tmp": "write",
-			},
+			kind: "workspace-mode",
+			mode: "read-only",
+			networkAccess: false,
+			writableRoots: ["/repo/a", "/repo/out", "/repo/reference"],
 		});
 	});
 
-	it("maps danger-full-access to an unrestricted profile", () => {
+	it("uses native danger-full-access even with filesystem restrictions", () => {
 		expect(
 			resolveCodexSandbox({
 				mode: "danger-full-access",
-				writableRoots: [],
+				workingDirectory: "/repo/a",
+				writableRoots: ["/repo/out"],
 				networkAccess: true,
-				sandboxSettings: {},
+				sandboxSettings: { allowRead: ["/repo/a"], allowWrite: ["/repo/out"] },
 			}),
 		).toEqual({
-			kind: "profile",
-			profileId: CYRUS_SANDBOX_PROFILE_ID,
+			kind: "workspace-mode",
+			mode: "danger-full-access",
+			writableRoots: ["/repo/a", "/repo/out"],
 			networkAccess: true,
-			filesystem: { ":root": "write" },
 		});
 	});
 

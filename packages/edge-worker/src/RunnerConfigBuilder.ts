@@ -176,6 +176,12 @@ export interface IssueRunnerConfigInput {
 	/** CA cert path for MITM TLS termination — passed via child process env */
 	egressCaCertPath?: string;
 	/**
+	 * Operator-whitelisted extra writable paths (absolute), from
+	 * `sandbox.writablePaths` / `CYRUS_SANDBOX_WRITABLE_PATHS`. Always applied
+	 * for Codex; applied for Claude when the egress sandbox is enabled.
+	 */
+	sandboxWritablePaths?: string[];
+	/**
 	 * GitHub App installation token matched to the session repository's org
 	 * (from the cyrus-hosted-pushed token store). When set, it's exposed to
 	 * the session ONLY as `CYRUS_GH_TOKEN` — the droplet's gh wrapper maps
@@ -186,7 +192,43 @@ export interface IssueRunnerConfigInput {
 	 * `gh auth login` the github-tokens push handler performs.
 	 */
 	githubToken?: string;
+	/**
+	 * Workflow permission boundary. Planning and Manual verification are
+	 * deliberately read-only regardless of repository/global tool defaults.
+	 */
+	workflowMode?: "implementation" | "planning" | "manual_verification";
 }
+
+export const WORKFLOW_READ_ONLY_TOOLS = [
+	"Read(**)",
+	"WebFetch",
+	"WebSearch",
+	"LSP",
+	"ToolSearch",
+] as const;
+
+/** Planning is local-only; Manual verification may still need read-only web I/O. */
+export const WORKFLOW_PLANNING_TOOLS = ["Read(**)", "LSP"] as const;
+
+export const WORKFLOW_MUTATION_TOOLS = [
+	"Edit(**)",
+	"Write(**)",
+	"Bash",
+	"NotebookEdit",
+	"EnterWorktree",
+	"ExitWorktree",
+	"Task",
+	"TaskCreate",
+	"TaskUpdate",
+	"SendMessage",
+	"PushNotification",
+	"CronCreate",
+	"CronDelete",
+	"ScheduleWakeup",
+	"RemoteTrigger",
+	"Workflow",
+	"DesignSync",
+] as const;
 
 export function resolveIssueMcpConfigPath(
 	repository: RepositoryConfig,
@@ -349,6 +391,26 @@ export class RunnerConfigBuilder {
 		runnerType: RunnerType;
 	} {
 		const log = input.logger;
+		const readOnlyWorkflow =
+			input.workflowMode === "planning" ||
+			input.workflowMode === "manual_verification";
+		const workflowAllowedTools = readOnlyWorkflow
+			? input.workflowMode === "planning"
+				? [...WORKFLOW_PLANNING_TOOLS]
+				: [
+						...WORKFLOW_READ_ONLY_TOOLS,
+						"mcp__cyrus-tools__linear_manual_verification_result",
+					]
+			: input.allowedTools;
+		const workflowDisallowedTools = readOnlyWorkflow
+			? [
+					...new Set([...input.disallowedTools, ...WORKFLOW_MUTATION_TOOLS]),
+				].filter(
+					(tool) =>
+						input.workflowMode !== "manual_verification" ||
+						tool !== "mcp__cyrus-tools__linear_manual_verification_result",
+				)
+			: input.disallowedTools;
 
 		// Configure hooks: PostToolUse for screenshot tools + PR-marker enforcement,
 		// plus the Stop hook that blocks the session when work is unshipped.
@@ -356,14 +418,17 @@ export class RunnerConfigBuilder {
 		const prMarkerHook = buildPrMarkerHook(log);
 		const intentToAddHook = buildIntentToAddHook(log);
 		const stopHook = this.buildStopHook(log);
-		const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
-			...stopHook,
-			PostToolUse: [
-				...(screenshotHooks.PostToolUse ?? []),
-				...(prMarkerHook.PostToolUse ?? []),
-				...(intentToAddHook.PostToolUse ?? []),
-			],
-		};
+		const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> =
+			readOnlyWorkflow
+				? {}
+				: {
+						...stopHook,
+						PostToolUse: [
+							...(screenshotHooks.PostToolUse ?? []),
+							...(prMarkerHook.PostToolUse ?? []),
+							...(intentToAddHook.PostToolUse ?? []),
+						],
+					};
 
 		// Determine runner type and model override from selectors
 		const runnerSelection = this.runnerSelector.determineRunnerSelection(
@@ -451,8 +516,8 @@ export class RunnerConfigBuilder {
 
 		const config: AgentRunnerConfig & Record<string, unknown> = {
 			workingDirectory: cwd,
-			allowedTools: input.allowedTools,
-			disallowedTools: input.disallowedTools,
+			allowedTools: workflowAllowedTools,
+			disallowedTools: workflowDisallowedTools,
 			allowedDirectories: input.allowedDirectories,
 			...(additionalDirectories.length > 0 && { additionalDirectories }),
 			workspaceName: input.session.issue?.identifier || input.session.issueId,
@@ -545,9 +610,69 @@ export class RunnerConfigBuilder {
 		// app-server permission profile (read/write allow-list).
 		if (runnerType === "codex" && input.sandboxSettings) {
 			config.sandboxSettings = {
-				allowWrite: [input.session.workspace.path],
+				allowWrite: readOnlyWorkflow ? [] : [input.session.workspace.path],
 				allowRead: [input.session.workspace.path, ...input.allowedDirectories],
 			};
+		}
+		if (runnerType === "codex" && readOnlyWorkflow) {
+			// Codex native shell/file tools are governed by its filesystem sandbox,
+			// not Claude-style allowedTools. Force a native read-only thread even when
+			// the global egress sandbox is disabled. The runner sends allowRead as
+			// runtime workspace roots rather than selecting a custom permission profile,
+			// which some ChatGPT workspace requirements reject before model execution.
+			config.sandbox = "read-only";
+			config.sandboxSettings = {
+				allowWrite: [],
+				allowRead: [input.session.workspace.path, ...input.allowedDirectories],
+			};
+			if (input.workflowMode === "planning") {
+				// A filesystem-only read-only sandbox would still let a shell command
+				// mutate GitHub or another remote API. Planning needs no outbound
+				// network access, so close that path as part of the Codex profile.
+				config.configOverrides = {
+					sandbox_workspace_write: { network_access: false },
+				};
+				config.webSearchMode = "disabled";
+			}
+		}
+
+		// Operator-whitelisted extra writable paths (e.g. `~/.supabase`). Codex
+		// adds these as writable roots in both its default workspace-write mode
+		// and the egress-sandbox profile, so containment is otherwise unchanged.
+		if (
+			runnerType === "codex" &&
+			!readOnlyWorkflow &&
+			input.sandboxWritablePaths?.length
+		) {
+			config.writableRoots = input.sandboxWritablePaths;
+		}
+
+		// Claude with the egress sandbox: the OS sandbox side is handled in
+		// buildSandboxConfig. On the tool-permission side, treat the paths as
+		// allowed directories (Read allow + exemption from the home-directory
+		// Read denylist) and grant Edit/Write on them — but only when the
+		// session already has Edit/Write, so read-only tool sets stay read-only.
+		if (
+			runnerType === "claude" &&
+			input.sandboxSettings &&
+			input.sandboxWritablePaths?.length
+		) {
+			const extra = input.sandboxWritablePaths;
+			config.allowedDirectories = [...input.allowedDirectories, ...extra];
+			const hasTool = (name: string) =>
+				workflowAllowedTools.some(
+					(t) => t === name || t.startsWith(`${name}(`),
+				);
+			const writeTools = ["Edit", "Write"].filter(hasTool);
+			if (writeTools.length > 0) {
+				// Absolute paths need an extra leading `/` in Claude tool patterns.
+				config.allowedTools = [
+					...workflowAllowedTools,
+					...writeTools.flatMap((tool) =>
+						extra.map((p) => `${tool}(/${p}/**)`),
+					),
+				];
+			}
 		}
 
 		if (input.resumeSessionId) {
@@ -605,10 +730,24 @@ export class RunnerConfigBuilder {
 					// See: https://code.claude.com/docs/en/settings#sandbox-path-prefixes
 					// allowedDirectories contains the attachments dir, repo paths, and git
 					// metadata dirs — all of which need OS-level read access alongside the worktree.
-					allowRead: [".", ...input.allowedDirectories],
+					// Operator-whitelisted writable paths (sandbox.writablePaths) are
+					// also readable, carving them out of the `~/` deny.
+					allowRead: [
+						".",
+						...input.allowedDirectories,
+						...(input.sandboxWritablePaths ?? []),
+					],
 					denyRead: ["~/"],
-					// Restrict subprocess writes to the session worktree only
-					allowWrite: [input.session.workspace.path],
+					// Planning and manual verification remain read-only. Other sessions
+					// may write to the worktree plus operator-whitelisted paths.
+					allowWrite:
+						input.workflowMode === "planning" ||
+						input.workflowMode === "manual_verification"
+							? []
+							: [
+									input.session.workspace.path,
+									...(input.sandboxWritablePaths ?? []),
+								],
 				},
 			};
 		}

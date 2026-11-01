@@ -8,10 +8,11 @@ import type {
 	IssueContext,
 	IssueMinimal,
 } from "./CyrusAgentSession.js";
+import type { PersistentCustomWorkflowState } from "./custom-workflow.js";
 import { createLogger, type ILogger } from "./logging/index.js";
 
 /** Current persistence format version */
-export const PERSISTENCE_VERSION = "4.0";
+export const PERSISTENCE_VERSION = "5.0";
 
 // Serialized versions with Date fields as strings
 export type SerializedCyrusAgentSession = CyrusAgentSession;
@@ -55,6 +56,7 @@ interface V2CyrusAgentSession {
 /**
  * Serializable EdgeWorker state for persistence
  *
+ * v5.0: v4 flat sessions plus persistent custom workflow state
  * v4.0: Flat session format - sessions keyed directly by sessionId (no repo nesting)
  * v3.0: Nested format - sessions keyed by [repoId][sessionId]
  */
@@ -67,6 +69,8 @@ export interface SerializableEdgeWorkerState {
 	// Issue to repository mapping (for caching user repository selections)
 	// v4.1: string[] (multi-repo). Migration: old Record<string, string> auto-converts.
 	issueRepositoryCache?: Record<string, string[]>;
+	/** Persistent approval/decomposition/Manual/merge workflow state (v5.0). */
+	customWorkflow?: PersistentCustomWorkflowState;
 }
 
 /**
@@ -136,7 +140,7 @@ export class PersistenceManager {
 
 	/**
 	 * Load EdgeWorker state from disk (single file for all repositories)
-	 * Automatically migrates from v2.0 to v3.0 format if needed.
+	 * Automatically migrates supported legacy formats to the current version.
 	 */
 	async loadEdgeWorkerState(): Promise<SerializableEdgeWorkerState | null> {
 		try {
@@ -161,7 +165,7 @@ export class PersistenceManager {
 
 			// Handle version migration
 			if (stateData.version === "2.0") {
-				this.logger.info("Migrating state from v2.0 to v3.0 to v4.0");
+				this.logger.info("Migrating state from v2.0 through v4.0 to v5.0");
 				const v3State = this.migrateV2ToV3(stateData.state);
 				const migratedState = this.migrateV3ToV4(v3State);
 				await this.saveEdgeWorkerState(migratedState);
@@ -172,10 +176,22 @@ export class PersistenceManager {
 			}
 
 			if (stateData.version === "3.0") {
-				this.logger.info("Migrating state from v3.0 to v4.0");
+				this.logger.info("Migrating state from v3.0 through v4.0 to v5.0");
 				const migratedState = this.migrateV3ToV4(
 					stateData.state as V3SerializableEdgeWorkerState,
 				);
+				await this.saveEdgeWorkerState(migratedState);
+				this.logger.info(
+					`Migration complete, saved as v${PERSISTENCE_VERSION}`,
+				);
+				return migratedState;
+			}
+
+			if (stateData.version === "4.0") {
+				this.logger.info("Migrating state from v4.0 to v5.0");
+				const migratedState: SerializableEdgeWorkerState = {
+					...(stateData.state as SerializableEdgeWorkerState),
+				};
 				await this.saveEdgeWorkerState(migratedState);
 				this.logger.info(
 					`Migration complete, saved as v${PERSISTENCE_VERSION}`,

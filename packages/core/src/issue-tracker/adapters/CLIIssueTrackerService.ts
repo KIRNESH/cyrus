@@ -13,6 +13,7 @@
 
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { IssueRelationType } from "@linear/sdk";
 import type {
 	IssueStateChangeMessage,
 	LinearIssueStateChangePlatformData,
@@ -40,6 +41,9 @@ import {
 	type FileUploadResponse,
 	type Issue,
 	type IssueCreateInput,
+	type IssueRelation,
+	type IssueRelationCreateInput,
+	type IssueRelationCreateResult,
 	type IssueTrackerAgentSession,
 	type IssueTrackerAgentSessionPayload,
 	type IssueUpdateInput,
@@ -56,6 +60,7 @@ import {
 	type CLIAgentSessionData,
 	type CLICommentData,
 	type CLIIssueData,
+	type CLIIssueRelationData,
 	type CLILabelData,
 	type CLITeamData,
 	type CLIUserData,
@@ -74,6 +79,7 @@ import {
  */
 export interface CLIIssueTrackerState {
 	issues: Map<string, CLIIssueData>;
+	issueRelations: Map<string, CLIIssueRelationData>;
 	comments: Map<string, CLICommentData>;
 	teams: Map<string, CLITeamData>;
 	labels: Map<string, CLILabelData>;
@@ -123,6 +129,7 @@ export class CLIIssueTrackerService
 		super();
 		this.state = {
 			issues: initialState?.issues ?? new Map(),
+			issueRelations: initialState?.issueRelations ?? new Map(),
 			comments: initialState?.comments ?? new Map(),
 			teams: initialState?.teams ?? new Map(),
 			labels: initialState?.labels ?? new Map(),
@@ -168,7 +175,42 @@ export class CLIIssueTrackerService
 			.map((id) => this.state.labels.get(id))
 			.filter((l): l is CLILabelData => l !== undefined);
 
-		return createCLIIssue(issueData, resolvedLabels);
+		return this.createIssueView(issueData, resolvedLabels);
+	}
+
+	private createIssueView(
+		issueData: CLIIssueData,
+		resolvedLabels?: CLILabelData[],
+		includeRelations = true,
+	): Issue {
+		const inverseRelations: IssueRelation[] = [];
+		if (includeRelations) {
+			for (const relation of this.state.issueRelations.values()) {
+				if (relation.relatedIssueId !== issueData.id) continue;
+				const source = this.state.issues.get(relation.issueId);
+				const related = this.state.issues.get(relation.relatedIssueId);
+				const type =
+					relation.type === "blocks"
+						? IssueRelationType.Blocks
+						: relation.type === "related"
+							? IssueRelationType.Related
+							: IssueRelationType.Duplicate;
+				inverseRelations.push({
+					id: relation.id,
+					type,
+					createdAt: relation.createdAt,
+					updatedAt: relation.updatedAt,
+					archivedAt: undefined,
+					issue: source
+						? Promise.resolve(this.createIssueView(source, undefined, false))
+						: undefined,
+					relatedIssue: related
+						? Promise.resolve(this.createIssueView(related, undefined, false))
+						: undefined,
+				});
+			}
+		}
+		return createCLIIssue(issueData, resolvedLabels, inverseRelations);
 	}
 
 	/**
@@ -244,6 +286,8 @@ export class CLIIssueTrackerService
 			teamId: team.id,
 			stateId: input.stateId,
 			assigneeId: input.assigneeId,
+			delegateId: input.delegateId,
+			projectId: input.projectId,
 			parentId: input.parentId,
 		};
 
@@ -256,12 +300,36 @@ export class CLIIssueTrackerService
 			.filter((l): l is CLILabelData => l !== undefined);
 
 		// Create and return the issue
-		const issue = createCLIIssue(issueData, resolvedLabels);
+		const issue = this.createIssueView(issueData, resolvedLabels);
 
 		// Emit state change event
 		this.emit("issue:created", { issue });
 
 		return issue;
+	}
+
+	async createIssueRelation(
+		input: IssueRelationCreateInput,
+	): Promise<IssueRelationCreateResult> {
+		await this.fetchIssue(input.issueId);
+		await this.fetchIssue(input.relatedIssueId);
+		const existing = [...this.state.issueRelations.values()].find(
+			(relation) =>
+				relation.issueId === input.issueId &&
+				relation.relatedIssueId === input.relatedIssueId &&
+				relation.type === input.type,
+		);
+		if (existing) return { success: true, relationId: existing.id };
+
+		const now = new Date();
+		const relation: CLIIssueRelationData = {
+			id: `relation-${randomUUID()}`,
+			...input,
+			createdAt: now,
+			updatedAt: now,
+		};
+		this.state.issueRelations.set(relation.id, relation);
+		return { success: true, relationId: relation.id };
 	}
 
 	/**
@@ -698,7 +766,7 @@ export class CLIIssueTrackerService
 	 * @param name - The label name to find or create
 	 * @returns The label ID
 	 */
-	async findOrCreateLabel(name: string): Promise<string> {
+	async findOrCreateLabel(name: string, teamId?: string): Promise<string> {
 		// First, try to find existing label by name
 		for (const [, labelData] of this.state.labels) {
 			if (labelData.name === name) {
@@ -718,7 +786,7 @@ export class CLIIssueTrackerService
 			isGroup: false,
 			createdAt: now,
 			updatedAt: now,
-			teamId: undefined, // Workspace-level label
+			teamId, // Workspace-level when omitted
 			creatorId: this.state.currentUserId,
 			parentId: undefined,
 		};
@@ -889,6 +957,8 @@ export class CLIIssueTrackerService
 			type: AgentSessionType.CommentThread,
 			createdAt: new Date(),
 			updatedAt: new Date(),
+			appUserId: "cli-app-user",
+			creatorId: this.state.currentUserId,
 			issueId: issue?.id,
 			commentId,
 		};
@@ -904,6 +974,7 @@ export class CLIIssueTrackerService
 
 		// Emit AgentSessionCreated webhook event if transport is available
 		if (this.eventTransport && issue) {
+			const currentUser = await this.fetchCurrentUser();
 			// Get team and state info for the issue
 			const issueData = this.state.issues.get(issue.id);
 			const team = issueData?.teamId
@@ -928,6 +999,13 @@ export class CLIIssueTrackerService
 					updatedAt: nowIso,
 					status: "active",
 					type: "issue",
+					creatorId: currentUser.id,
+					creator: {
+						id: currentUser.id,
+						name: currentUser.name,
+						email: currentUser.email,
+						url: currentUser.url,
+					},
 					issue: {
 						id: issue.id,
 						identifier: issue.identifier,
@@ -951,7 +1029,12 @@ export class CLIIssueTrackerService
 								id: comment.id,
 								body: comment.body,
 							}
-						: undefined,
+						: {
+								id: `delegation-${sessionId}`,
+								body: "This thread is for an agent session",
+								issueId: issue.id,
+								userId: currentUser.id,
+							},
 				},
 				guidance: [], // Empty array for CLI mode
 			};
@@ -1256,6 +1339,7 @@ export class CLIIssueTrackerService
 		if (this.eventTransport) {
 			const issue = await this.fetchIssue(sessionData.issueId);
 			if (issue) {
+				const currentUser = await this.fetchCurrentUser();
 				const issueData = this.state.issues.get(issue.id);
 				const team = issueData?.teamId
 					? await this.fetchTeam(issueData.teamId)
@@ -1278,6 +1362,13 @@ export class CLIIssueTrackerService
 						updatedAt: nowIso,
 						status: sessionData.status,
 						type: "issue",
+						creatorId: currentUser.id,
+						creator: {
+							id: currentUser.id,
+							name: currentUser.name,
+							email: currentUser.email,
+							url: currentUser.url,
+						},
 						issue: {
 							id: issue.id,
 							identifier: issue.identifier,
@@ -1296,10 +1387,17 @@ export class CLIIssueTrackerService
 										name: "Default Team",
 									},
 						},
+						comment: {
+							id: `delegation-${sessionId}`,
+							body: "This thread is for an agent session",
+							issueId: issue.id,
+							userId: currentUser.id,
+						},
 					},
 					agentActivity: {
 						id: `activity-prompt-${Date.now()}`,
 						agentSessionId: sessionId,
+						userId: currentUser.id,
 						content: { type: "prompt", body: message },
 						createdAt: nowIso,
 						updatedAt: nowIso,

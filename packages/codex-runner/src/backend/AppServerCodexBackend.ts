@@ -235,6 +235,12 @@ export class AppServerCodexBackend
 		config: ResolvedCodexConfig,
 	): Record<string, unknown> {
 		const sandbox = config.sandbox;
+		const runtimeWorkspaceRoots =
+			sandbox.kind === "workspace-mode" && sandbox.mode === "read-only"
+				? sandbox.writableRoots.filter(
+						(root) => root !== config.workingDirectory,
+					)
+				: [];
 		// `sandbox` (coarse mode) and `permissions` (named profile) are mutually
 		// exclusive on thread/start; pick exactly one based on the resolved arm.
 		const sandboxParams =
@@ -243,6 +249,7 @@ export class AppServerCodexBackend
 				: { sandbox: sandbox.mode };
 		return {
 			...(config.workingDirectory ? { cwd: config.workingDirectory } : {}),
+			...(runtimeWorkspaceRoots.length > 0 ? { runtimeWorkspaceRoots } : {}),
 			approvalPolicy: config.approvalPolicy,
 			...sandboxParams,
 			...(config.model ? { model: config.model } : {}),
@@ -256,8 +263,9 @@ export class AppServerCodexBackend
 	/**
 	 * Build the free-form Codex `config` for thread/start. The app-server has no
 	 * `--add-dir` flag, so:
-	 * - `workspace-mode`: writable roots + network ride on `sandbox_workspace_write`
-	 *   (only meaningful in workspace-write mode; omitted otherwise).
+	 * - `workspace-mode`: read-only roots ride on `runtimeWorkspaceRoots`; writable
+	 *   roots + network ride on `sandbox_workspace_write` (only meaningful in
+	 *   workspace-write mode; omitted otherwise).
 	 * - `profile`: the granular permission profile body is registered under
 	 *   `permissions.<id>` and selected via the `permissions` thread param.
 	 * MCP servers etc. ride along in configOverrides.
@@ -266,6 +274,9 @@ export class AppServerCodexBackend
 		const base: CodexConfigOverrides = config.configOverrides
 			? { ...config.configOverrides }
 			: {};
+		if (config.webSearchMode) {
+			base.web_search = config.webSearchMode;
+		}
 		const sandbox = config.sandbox;
 
 		if (sandbox.kind === "profile") {

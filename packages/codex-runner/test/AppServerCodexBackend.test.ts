@@ -148,7 +148,20 @@ describe("AppServerCodexBackend", () => {
 		});
 	});
 
-	it("omits sandbox_workspace_write for non-workspace-write modes", async () => {
+	it("forwards disabled web search in thread config", async () => {
+		const { backend, client } = makeBackend();
+		await backend.open({
+			...baseConfig,
+			codexPath: "/bin/true",
+			webSearchMode: "disabled",
+		});
+		const params = client.lastRequest("thread/start")?.params as {
+			config?: { web_search?: string };
+		};
+		expect(params.config?.web_search).toBe("disabled");
+	});
+
+	it("sends native read-only roots as runtime workspace roots", async () => {
 		const { backend, client } = makeBackend();
 		await backend.open({
 			...baseConfig,
@@ -156,6 +169,47 @@ describe("AppServerCodexBackend", () => {
 			sandbox: {
 				kind: "workspace-mode",
 				mode: "read-only",
+				writableRoots: ["/tmp/repo", "/repo/reference"],
+				networkAccess: false,
+			},
+		});
+		const params = client.lastRequest("thread/start")?.params as {
+			sandbox?: string;
+			runtimeWorkspaceRoots?: string[];
+		};
+		expect(params.sandbox).toBe("read-only");
+		expect(params.runtimeWorkspaceRoots).toEqual(["/repo/reference"]);
+	});
+
+	it("does not duplicate cwd as a runtime workspace root", async () => {
+		const { backend, client } = makeBackend();
+		await backend.open({
+			...baseConfig,
+			codexPath: "/bin/true",
+			sandbox: {
+				kind: "workspace-mode",
+				mode: "read-only",
+				writableRoots: ["/tmp/repo"],
+				networkAccess: false,
+			},
+		});
+		const params = client.lastRequest("thread/start")?.params as {
+			runtimeWorkspaceRoots?: string[];
+		};
+		expect(params.runtimeWorkspaceRoots).toBeUndefined();
+	});
+
+	it.each([
+		"read-only",
+		"danger-full-access",
+	] as const)("serializes native %s without workspace-write overrides", async (mode) => {
+		const { backend, client } = makeBackend();
+		await backend.open({
+			...baseConfig,
+			codexPath: "/bin/true",
+			sandbox: {
+				kind: "workspace-mode",
+				mode,
 				writableRoots: [],
 				networkAccess: false,
 			},
@@ -164,7 +218,7 @@ describe("AppServerCodexBackend", () => {
 			sandbox?: string;
 			config?: { sandbox_workspace_write?: Record<string, unknown> };
 		};
-		expect(params.sandbox).toBe("read-only");
+		expect(params.sandbox).toBe(mode);
 		expect(params.config?.sandbox_workspace_write).toBeUndefined();
 	});
 

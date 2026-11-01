@@ -53,6 +53,31 @@ vi.mock("cyrus-core", async (importOriginal) => {
 vi.mock("file-type");
 
 describe("EdgeWorker - Runner Selection Based on Labels", () => {
+	it.each([
+		undefined,
+		"workspace-write",
+		"read-only",
+		"danger-full-access",
+	] as const)("applies operator Codex sandbox mode %s in the shared runner factory", (mode) => {
+		const worker = new EdgeWorker({ ...mockConfig, codexSandboxMode: mode });
+		(worker as any).buildRunnerForType("codex", {
+			workingDirectory: "/test/repo",
+		});
+		expect(capturedRunnerConfig.sandbox).toBe(mode ?? "workspace-write");
+	});
+
+	it("preserves a workflow's narrower Codex sandbox mode", () => {
+		const worker = new EdgeWorker({
+			...mockConfig,
+			codexSandboxMode: "danger-full-access",
+		});
+		(worker as any).buildRunnerForType("codex", {
+			workingDirectory: "/test/repo",
+			sandbox: "read-only",
+		});
+		expect(capturedRunnerConfig.sandbox).toBe("read-only");
+	});
+
 	let edgeWorker: EdgeWorker;
 	let mockConfig: EdgeWorkerConfig;
 	let mockLinearClient: any;

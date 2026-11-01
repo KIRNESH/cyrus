@@ -85,6 +85,15 @@ export interface CLIIssueData {
 	favoriteId?: string;
 }
 
+export interface CLIIssueRelationData {
+	id: string;
+	issueId: string;
+	relatedIssueId: string;
+	type: "blocks" | "related" | "duplicate";
+	createdAt: Date;
+	updatedAt: Date;
+}
+
 /**
  * Internal storage for a CLI Comment.
  */
@@ -251,6 +260,7 @@ export interface CLIAgentActivityData {
 export function createCLIIssue(
 	data: CLIIssueData,
 	resolvedLabels?: CLILabelData[],
+	inverseRelationNodes: IssueRelation[] = [],
 ): Issue {
 	// Create a partial object with all the required properties
 	const issue = {
@@ -382,7 +392,7 @@ export function createCLIIssue(
 				"id"
 			>,
 		): Promise<Connection<IssueRelation>> {
-			return Promise.resolve({ nodes: [] });
+			return Promise.resolve({ nodes: inverseRelationNodes });
 		},
 		update(
 			_input?: LinearSDK.LinearDocument.IssueUpdateInput,

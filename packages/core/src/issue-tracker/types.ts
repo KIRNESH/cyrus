@@ -57,8 +57,11 @@ export type Issue = Pick<
 	| "url"
 	| "branchName"
 	| "assigneeId"
+	| "delegateId"
 	| "stateId"
 	| "teamId"
+	| "projectId"
+	| "parentId"
 	| "labelIds"
 	| "priority"
 	| "createdAt"
@@ -609,6 +612,10 @@ export interface IssueCreateInput {
 	assigneeId?: string;
 	/** Parent issue ID (for sub-issues) */
 	parentId?: string;
+	/** Project ID inherited by decomposed child issues. */
+	projectId?: string;
+	/** Agent/app-user ID used for supported Linear delegation. */
+	delegateId?: string;
 	/** Label IDs to apply */
 	labelIds?: string[];
 	/** Additional platform-specific fields */
@@ -631,10 +638,27 @@ export interface IssueUpdateInput {
 	priority?: IssuePriority;
 	/** New parent ID */
 	parentId?: string;
+	/** New project ID */
+	projectId?: string;
+	/** Agent/app-user ID used for supported Linear delegation. */
+	delegateId?: string;
 	/** Label IDs to set */
 	labelIds?: string[];
 	/** Additional platform-specific fields */
 	[key: string]: unknown;
+}
+
+export interface IssueRelationCreateInput {
+	/** The blocking/source issue. */
+	issueId: string;
+	/** The related/blocked issue. */
+	relatedIssueId: string;
+	type: "blocks" | "related" | "duplicate";
+}
+
+export interface IssueRelationCreateResult {
+	success: boolean;
+	relationId: string;
 }
 
 /**

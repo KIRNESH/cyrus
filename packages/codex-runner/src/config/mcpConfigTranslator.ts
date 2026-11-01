@@ -289,6 +289,7 @@ export function buildCodexMcpServersConfig(
 	}
 
 	const allowedToolsFilters = buildMcpAllowedToolsFilters(input.allowedTools);
+	const hasExplicitAllowedTools = input.allowedTools !== undefined;
 
 	const codexServers: Record<string, CodexConfigOverrides> = {};
 	for (const [serverName, rawConfig] of Object.entries(mergedServers)) {
@@ -336,6 +337,13 @@ export function buildCodexMcpServersConfig(
 			allowedToolsFilters,
 			serverName,
 		);
+		// An explicit Cyrus allow-list is authoritative. In particular, planning
+		// supplies a local-only list with no MCP entries; retaining configured MCP
+		// servers here would let Codex bypass both the tool list and the sandbox's
+		// network boundary through an out-of-process connector.
+		if (hasExplicitAllowedTools && !allowedToolsFilter) {
+			continue;
+		}
 		const hasNativeToolFilter =
 			Object.hasOwn(mapped, "enabled_tools") ||
 			Object.hasOwn(mapped, "disabled_tools");

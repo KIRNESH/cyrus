@@ -8,7 +8,7 @@
  * @module issue-tracker/adapters/LinearIssueTrackerService
  */
 
-import type { LinearClient } from "@linear/sdk";
+import { IssueRelationType, type LinearClient } from "@linear/sdk";
 
 /**
  * OAuth configuration for automatic token refresh.
@@ -42,6 +42,9 @@ import type {
 	IAgentEventTransport,
 	IIssueTrackerService,
 	Issue,
+	IssueCreateInput,
+	IssueRelationCreateInput,
+	IssueRelationCreateResult,
 	IssueUpdateInput,
 	IssueWithChildren,
 	Label,
@@ -317,6 +320,53 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 	 */
 	async fetchIssue(idOrIdentifier: string): Promise<Issue> {
 		return await this.linearClient.issue(idOrIdentifier);
+	}
+
+	async createIssue(input: IssueCreateInput): Promise<Issue> {
+		const payload = await this.linearClient.createIssue(input);
+		if (!payload.success) {
+			throw new Error("Linear API returned success=false while creating issue");
+		}
+		const issue = await payload.issue;
+		if (!issue) throw new Error("Created issue was not returned by Linear");
+		return issue;
+	}
+
+	async createIssueRelation(
+		input: IssueRelationCreateInput,
+	): Promise<IssueRelationCreateResult> {
+		const type =
+			input.type === "blocks"
+				? IssueRelationType.Blocks
+				: input.type === "related"
+					? IssueRelationType.Related
+					: IssueRelationType.Duplicate;
+		// Reconcile before writing so retries after a crash do not duplicate a
+		// relation that Linear accepted before Cyrus persisted its local state.
+		const relatedIssue = await this.linearClient.issue(input.relatedIssueId);
+		const inverseRelations = await relatedIssue.inverseRelations({
+			first: 250,
+		});
+		for (const relation of inverseRelations.nodes) {
+			if (relation.type !== type) continue;
+			const source = await relation.issue;
+			if (source?.id === input.issueId) {
+				return { success: true, relationId: relation.id };
+			}
+		}
+		const payload = await this.linearClient.createIssueRelation({
+			issueId: input.issueId,
+			relatedIssueId: input.relatedIssueId,
+			type,
+		});
+		if (!payload.success) {
+			throw new Error(
+				"Linear API returned success=false while creating issue relation",
+			);
+		}
+		const relation = await payload.issueRelation;
+		if (!relation) throw new Error("Created issue relation was not returned");
+		return { success: true, relationId: relation.id };
 	}
 
 	/**
@@ -702,6 +752,25 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 			}
 			throw err;
 		}
+	}
+
+	async findOrCreateLabel(name: string, teamId?: string): Promise<string> {
+		const labels = await this.fetchLabels({ first: 250 });
+		const existing = labels.nodes.find(
+			(label) => label.name.toLowerCase() === name.toLowerCase(),
+		);
+		if (existing) return existing.id;
+
+		const payload = await this.linearClient.createIssueLabel({
+			name,
+			...(teamId ? { teamId } : {}),
+		});
+		if (!payload.success) {
+			throw new Error("Linear API returned success=false while creating label");
+		}
+		const label = await payload.issueLabel;
+		if (!label) throw new Error("Created label was not returned by Linear");
+		return label.id;
 	}
 
 	// ========================================================================
